@@ -1,11 +1,7 @@
 from fastapi.testclient import TestClient
 
-from app.main import app
 
-client = TestClient(app)
-
-
-def test_health_endpoint_returns_application_status() -> None:
+def test_health_endpoint_returns_application_status(client: TestClient) -> None:
     response = client.get("/health")
 
     assert response.status_code == 200
@@ -16,7 +12,7 @@ def test_health_endpoint_returns_application_status() -> None:
     }
 
 
-def test_root_endpoint_links_to_api_documentation() -> None:
+def test_root_endpoint_links_to_api_documentation(client: TestClient) -> None:
     response = client.get("/")
 
     assert response.status_code == 200
@@ -26,7 +22,7 @@ def test_root_endpoint_links_to_api_documentation() -> None:
     }
 
 
-def test_openapi_metadata_matches_application_details() -> None:
+def test_openapi_metadata_matches_application_details(client: TestClient) -> None:
     response = client.get("/openapi.json")
 
     assert response.status_code == 200
@@ -37,3 +33,13 @@ def test_openapi_metadata_matches_application_details() -> None:
         ),
         "version": "0.1.0",
     }
+
+
+def test_openapi_documents_sample_registration_endpoint(client: TestClient) -> None:
+    response = client.get("/openapi.json")
+
+    assert response.status_code == 200
+    assert "/api/v1/samples" in response.json()["paths"]
+    assert "post" in response.json()["paths"]["/api/v1/samples"]
+    assert "get" in response.json()["paths"]["/api/v1/samples"]
+    assert "get" in response.json()["paths"]["/api/v1/samples/{sample_id}"]
