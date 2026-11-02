@@ -5,9 +5,11 @@ from pathlib import Path
 from fastapi import FastAPI
 from sqlalchemy.orm import sessionmaker
 
+from app.api.datasets import router as datasets_router
 from app.api.samples import router as samples_router
 from app.api.sample_images import router as sample_images_router
 from app.domain.base import Base
+from app.domain.dataset import Dataset
 from app.domain.sample_image import SampleImage
 from app.persistence.database import create_database_engine, get_database_url
 from app.settings.uploads import create_upload_settings
@@ -46,6 +48,7 @@ def create_app(
         version=VERSION,
         lifespan=lifespan,
     )
+    app.include_router(datasets_router)
     app.include_router(samples_router)
     app.include_router(sample_images_router)
     app.add_api_route("/", read_root, methods=["GET"])

@@ -47,3 +47,12 @@ def test_openapi_documents_sample_registration_endpoint(client: TestClient) -> N
         "post"
         in response.json()["paths"]["/api/v1/samples/{sample_id}/images"]
     )
+
+
+def test_openapi_documents_dataset_registry_endpoints(client: TestClient) -> None:
+    response = client.get("/openapi.json")
+
+    assert response.status_code == 200
+    assert "post" in response.json()["paths"]["/api/v1/datasets"]
+    assert "get" in response.json()["paths"]["/api/v1/datasets"]
+    assert "get" in response.json()["paths"]["/api/v1/datasets/{dataset_id}"]
