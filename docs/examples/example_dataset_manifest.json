@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "dataset": {
+    "dataset_id": "fictional-example-dataset",
+    "name": "Fictional placeholder dataset",
+    "description": "Illustrative manifest only; this does not describe a real dataset.",
+    "source": {
+      "name": "Fictional placeholder source",
+      "reference": "https://example.invalid/dataset-placeholder",
+      "licence": {
+        "name": "Fictional placeholder licence; no usage rights granted",
+        "reference": "https://example.invalid/licence-placeholder",
+        "usage_notes": "Placeholder only. Not a real licence or permission to use data."
+      }
+    },
+    "example_only": true
+  },
+  "images": [
+    {
+      "image_id": "fictional-image-id-001",
+      "sample_id": "fictional-sample-id-001",
+      "relative_path": "datasets/raw/fictional-placeholder-image.jpg",
+      "material_type": "fictional-placeholder-material-type",
+      "visual_labels": [
+        {
+          "label": "fictional-placeholder-label",
+          "source": {
+            "type": "fictional-placeholder-source-type",
+            "description": "Placeholder only; not an observation or verified label."
+          }
+        }
+      ],
+      "acquisition_conditions": {
+        "description": "Fictional placeholder; no photograph or acquisition occurred."
+      },
+      "split": "unassigned"
+    }
+  ]
+}

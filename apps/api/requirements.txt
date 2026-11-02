@@ -4,3 +4,4 @@ httpx
 pytest
 SQLAlchemy>=2.0,<3.0
 python-multipart
+jsonschema>=4.21,<5.0

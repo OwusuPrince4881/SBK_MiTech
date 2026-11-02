@@ -20,3 +20,23 @@ build/
 # Local-only data and uploads
 data/*
 !data/.gitkeep
+!data/README.md
+!data/datasets/
+data/datasets/*
+!data/datasets/raw/
+!data/datasets/processed/
+!data/datasets/manifests/
+data/datasets/raw/*
+!data/datasets/raw/.gitkeep
+data/datasets/processed/*
+!data/datasets/processed/.gitkeep
+data/datasets/manifests/*
+!data/datasets/manifests/.gitkeep
+!data/uploads/
+data/uploads/*
+!data/uploads/.gitkeep
+!data/evaluation/
+data/evaluation/*
+!data/evaluation/umat_practicals/
+data/evaluation/umat_practicals/*
+!data/evaluation/umat_practicals/.gitkeep

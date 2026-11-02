@@ -54,10 +54,13 @@ def test_upload_image_returns_and_persists_metadata(client: TestClient) -> None:
             select(SampleImage).where(SampleImage.id == UUID(metadata["id"]))
         )
     assert persisted is not None
+    assert persisted.image_id == UUID(metadata["id"])
+    assert persisted.id == persisted.image_id
     assert persisted.sample_id == UUID(sample_id)
     assert persisted.original_filename == "unsafe.jpg"
     assert persisted.mime_type == "image/jpeg"
     assert persisted.file_size == len(image_content)
+    assert persisted.relative_path == metadata["storage_path"]
     assert persisted.storage_path == metadata["storage_path"]
     assert persisted.uploaded_at is not None
 
