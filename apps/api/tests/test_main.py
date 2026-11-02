@@ -43,3 +43,7 @@ def test_openapi_documents_sample_registration_endpoint(client: TestClient) -> N
     assert "post" in response.json()["paths"]["/api/v1/samples"]
     assert "get" in response.json()["paths"]["/api/v1/samples"]
     assert "get" in response.json()["paths"]["/api/v1/samples/{sample_id}"]
+    assert (
+        "post"
+        in response.json()["paths"]["/api/v1/samples/{sample_id}/images"]
+    )

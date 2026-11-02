@@ -1,18 +1,26 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from sqlalchemy.orm import sessionmaker
 
 from app.api.samples import router as samples_router
+from app.api.sample_images import router as sample_images_router
 from app.domain.base import Base
+from app.domain.sample_image import SampleImage
 from app.persistence.database import create_database_engine, get_database_url
+from app.settings.uploads import create_upload_settings
 
 APPLICATION_NAME = "MineMat AI API"
 VERSION = "0.1.0"
 
 
-def create_app(database_url: str | None = None) -> FastAPI:
+def create_app(
+    database_url: str | None = None,
+    upload_directory: Path | None = None,
+    max_upload_size_bytes: int | None = None,
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         engine = create_database_engine(database_url or get_database_url())
@@ -20,6 +28,10 @@ def create_app(database_url: str | None = None) -> FastAPI:
         app.state.session_factory = sessionmaker(
             bind=engine,
             expire_on_commit=False,
+        )
+        app.state.upload_settings = create_upload_settings(
+            directory=upload_directory,
+            max_file_size_bytes=max_upload_size_bytes,
         )
         try:
             yield
@@ -35,6 +47,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.include_router(samples_router)
+    app.include_router(sample_images_router)
     app.add_api_route("/", read_root, methods=["GET"])
     app.add_api_route("/health", read_health, methods=["GET"])
     return app

@@ -3,3 +3,4 @@ uvicorn
 httpx
 pytest
 SQLAlchemy>=2.0,<3.0
+python-multipart
