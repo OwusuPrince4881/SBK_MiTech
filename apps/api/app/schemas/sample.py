@@ -5,12 +5,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class SampleCreate(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    sample_name: str = Field(min_length=1)
-    material_description: str = Field(min_length=1)
-    collection_location: str = Field(min_length=1)
-    intended_application: str = Field(min_length=1)
+    sample_name: str = Field(min_length=1, max_length=200)
+    material_description: str = Field(min_length=1, max_length=2000)
+    collection_location: str = Field(min_length=1, max_length=200)
+    intended_application: str = Field(min_length=1, max_length=2000)
 
 
 class SampleResponse(BaseModel):
