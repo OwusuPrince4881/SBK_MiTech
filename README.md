@@ -86,6 +86,15 @@ npm test          # Vitest + React Testing Library, API calls mocked
 npm run build     # type-check (tsc) and production build
 ```
 
+### Dataset tools
+
+Offline scripts in `apps/api/scripts` validate dataset manifests, generate
+reproducible train/validation/test splits grouped by physical sample, and audit
+for data leakage. They do not use the database or the API. See
+[`docs/dataset_workflow.md`](docs/dataset_workflow.md) for the commands and
+[`docs/dataset_manifest_schema_1_1.md`](docs/dataset_manifest_schema_1_1.md) for
+the manifest format.
+
 ## Architecture
 
 The planned application uses a React and TypeScript frontend with a Python

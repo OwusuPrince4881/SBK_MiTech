@@ -1,0 +1,94 @@
+{
+  "schema_version": "1.1",
+  "dataset": {
+    "dataset_id": "fictional-example-dataset",
+    "name": "Fictional placeholder dataset",
+    "description": "Illustrative manifest only; this does not describe a real dataset, and no image files exist for it.",
+    "category": "synthetic",
+    "source": {
+      "name": "Fictional placeholder source",
+      "url": "https://example.invalid/dataset-placeholder",
+      "retrieved_on": "2026-01-01"
+    },
+    "licence": {
+      "name": "Fictional placeholder licence; no usage rights granted",
+      "version": "fictional-0",
+      "url": "https://example.invalid/licence-placeholder",
+      "usage_notes": "Placeholder only. Not a real licence or permission to use data.",
+      "evidence": {
+        "captured_on": "2026-01-01",
+        "archive_url": "https://archive.example.invalid/licence-placeholder",
+        "reference": "fictional-evidence-reference",
+        "notes": "Fictional. A real manifest would add a snapshot of the licence text (relative_path and sha256) or point to where it is kept."
+      }
+    },
+    "permissions": {
+      "status": "unknown",
+      "permitted_uses": [],
+      "commercial_training": "unknown",
+      "notes": "Permissions have not been reviewed, so this manifest cannot be cleared for any use."
+    },
+    "sample_identity": {
+      "basis": "declared_by_source",
+      "notes": "Fictional: pretend the source documents which images show the same physical sample."
+    },
+    "label_vocabulary": {
+      "vocabulary_id": "fictional-vocabulary",
+      "version": "0",
+      "categories": [
+        "fictional-category-a",
+        "fictional-category-b"
+      ]
+    }
+  },
+  "records": [
+    {
+      "record_id": "fictional-record-001",
+      "physical_sample_id": "fictional-sample-001",
+      "capture_session_id": "fictional-session-001",
+      "file": {
+        "filename": "fictional-image-001.jpg",
+        "relative_path": "images/fictional-sample-001/fictional-image-001.jpg",
+        "sha256": "2c53489d399563d835c8928529842df89fa592175a1df284207d7283812f354f",
+        "media_type": "image/jpeg"
+      },
+      "split": "unassigned",
+      "label": {
+        "material_category": "fictional-category-a",
+        "source": {
+          "type": "human_visual",
+          "description": "Fictional placeholder; not a real observation or verified label."
+        }
+      },
+      "acquisition": {
+        "lighting": "fictional placeholder",
+        "moisture_condition": "fictional placeholder",
+        "scale_reference": {
+          "present": false
+        },
+        "camera": {
+          "make": "fictional placeholder"
+        }
+      }
+    },
+    {
+      "record_id": "fictional-record-002",
+      "physical_sample_id": "fictional-sample-001",
+      "capture_session_id": "fictional-session-001",
+      "file": {
+        "filename": "fictional-image-002.jpg",
+        "relative_path": "images/fictional-sample-001/fictional-image-002.jpg",
+        "sha256": "8d7729a59f1a7e4552a8580d26b0eb3df5c6d0bc2a1aafec35b468632f46af4a",
+        "media_type": "image/jpeg"
+      },
+      "split": "unassigned",
+      "label": {
+        "material_category": "fictional-category-a",
+        "source": {
+          "type": "human_visual",
+          "description": "Fictional placeholder; not a real observation or verified label."
+        }
+      }
+    }
+  ]
+}

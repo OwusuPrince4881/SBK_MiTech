@@ -79,16 +79,18 @@ category, no checksum and no version.
 ```
 apps/api/app/{api,domain,persistence,schemas,services,settings,storage}   implemented
 apps/api/app/{engineering,ml}      EMPTY packages (placeholders for future logic)
-apps/api/scripts/validate_dataset_manifest.py
-apps/api/tests/                    pytest suite (conftest.py + 5 test files)
+apps/api/app/dataset_manifest/     offline manifest tooling (validation, splits, leakage audit); pure Python, no FastAPI/SQLAlchemy
+apps/api/scripts/{validate_dataset_manifest,generate_dataset_splits,audit_dataset_leakage}.py
+apps/api/tests/                    pytest suite (conftest.py, dataset_builders.py + 9 test files)
 apps/api/migrations/               only .gitkeep — no Alembic yet
 apps/api/requirements.txt
 apps/web, packages, tests/         .gitkeep placeholders only
-docs/dataset_strategy.md, docs/dataset_manifest.schema.json, docs/examples/example_dataset_manifest.json
+docs/dataset_strategy.md, docs/dataset_workflow.md, docs/dataset_manifest.schema.json (1.0), docs/dataset_manifest_1_1.schema.json,
+docs/dataset_manifest_schema_1_1.md, docs/examples/example_dataset_manifest.json, docs/examples/example_dataset_manifest_1_1.json
 data/                              git-ignored local data (see section 11)
 ```
 
-`data/` holds `datasets/{raw,processed,manifests}/`, `evaluation/umat_practicals/`, `uploads/`, `README.md`,
+`data/` holds `datasets/{raw,processed,manifests}/`, `evaluation/umat_practicals/` (restricted), `uploads/` (restricted), `README.md`,
 and the local dev database `minemat_ai.db`. Only `.gitkeep` files and `data/README.md` are tracked.
 
 ## 6. Technology stack
@@ -177,7 +179,7 @@ server/proxy as well as in code.
 
 `docs/dataset_strategy.md` defines three data categories that must stay separate and identifiable:
 1. **Public research datasets** — only after provenance, licence and permitted uses are reviewed and recorded.
-2. **UMaT practical samples** — independent evaluation only; never training, tuning or validation data.
+2. **UMaT practical samples** — restricted: never used for training, validation, testing or independent AI evaluation (see below).
 3. **Future Ghanaian field data** — needs a collection protocol, permission and consent where applicable, location
    precision/privacy handling.
 
@@ -186,28 +188,63 @@ with documented steps); record split assignments, never infer them from folder n
 accepting a dataset and do not ingest or use data whose rights are unclear; keep real datasets, photographs and private or
 identifying data out of Git; never present fabricated values as real measurements.
 
+Restricted material: UMaT practical samples, and anything the MN273 brief classifies as RED-zone (photographs, raw laboratory
+records, supplier and purchase records, the team dataset), must not be used for training, validation, testing or independent
+AI evaluation. An authorisation reference, approval field, licence record or dataset category never overrides this, and the code
+has no exception mechanism. Any future proposed exception needs explicit written permission from the appropriate authority and a
+separate governance review before any processing, outside the tools. Claude sessions must not read, hash, list or process the
+restricted locations (`data/evaluation`, `data/umat_practicals`, `data/uploads`) or this material.
 What is and is not enforced today (verified):
-- The manifest schema (`docs/dataset_manifest.schema.json`, JSON Schema 2020-12, `schema_version` const `"1.0"`,
-  `additionalProperties: false` everywhere) controls only `split` (`train|validation|test|independent_evaluation|unassigned`).
-  Everything else is free text. It has **no** dataset category, checksums, dataset version, custodian, consent/authorisation,
-  location-privacy, or derivation fields.
-- `apps/api/scripts/validate_dataset_manifest.py` performs JSON Schema validation only: it never opens image files and cannot
-  detect duplicate `image_id`s, one `sample_id` appearing in several splits (leakage), or `independent_evaluation` images
-  outside the UMaT area. `format: date-time` for `captured_at` is **not enforced**: the installed `jsonschema` has no
-  `date-time` checker without an extra package (`rfc3339-validator`), which is not in `requirements.txt`. Treat
-  `captured_at` as unvalidated.
-- The registry (`Dataset`) and the manifest are separate, unlinked definitions with different names and types: registry
+- Manifest schema 1.0 (`docs/dataset_manifest.schema.json`, `schema_version` const `"1.0"`) controls only `split`
+  (`train|validation|test|independent_evaluation|unassigned`); everything else is free text, with **no** dataset category,
+  checksums, permissions, custodian, location-privacy or derivation fields. Schema 1.1 (`docs/dataset_manifest_1_1.schema.json`,
+  Milestone 2B, documented in `docs/dataset_manifest_schema_1_1.md`) adds the dataset category (`public|synthetic|umat_practical|
+  ghana_field`), licence version, URL and preserved evidence (a checksummed snapshot of the licence text, an archive link or a
+  reference, with its capture date), permissions (status, permitted uses, commercial-training status and its basis, reviewer and
+  date, an informational authorisation reference), the basis of the physical sample IDs, capture session IDs, per-file SHA-256, a dataset-declared
+  label vocabulary and provenance. Both are JSON
+  Schema 2020-12 with `additionalProperties: false`. 1.1 still has **no** location/privacy, laboratory-measurement, video or
+  registry-link fields, so it is not yet sufficient for `ghana_field` data. Material categories are never defined by this repo.
+- `apps/api/scripts/validate_dataset_manifest.py` (library: `app/dataset_manifest/`) validates both versions: structure, unique
+  IDs and paths, one split per physical sample, evaluation isolation (evaluation records never share a manifest with other splits,
+  in either version), derivations, and for 1.1 the licence/permission rules, label vocabulary and dates. **Restricted material is
+  refused in every tool:** category `umat_practical` is an error for every use (an authorisation reference is ignored), manifests
+  mentioning UMaT or MN273 in their dataset ID, name, source or paths are refused whatever their category, and the tools refuse the
+  restricted locations (`data/evaluation`, `data/umat_practicals`, `data/uploads`) lexically, before touching the file system, for
+  datasets, manifests, source manifests and outputs (`app/dataset_manifest/restricted.py`). **A use is accepted only against
+  verified files:** `--use` (and the splitter) need `--dataset-dir`, files and the licence **snapshot** matching their recorded
+  checksums, and a snapshot (a reference or link does not clear a use); the output says "recorded permission accepted", never
+  "confirmed", because the tools do not judge licences; commercial training is cleared separately and only if training is permitted.
+  With `--dataset-dir` the validator also checks that the recorded path matches the on-disk letter case (judged from the
+  directory listing), reports unlisted files (an unlisted image or video, including one recognised by its first bytes, is an error),
+  and treats any symbolic link or junction as an error (never followed); `--ignore-file` leaves out only non-image files and every
+  ignored file is listed. Derivations across datasets need the source manifest (`--source-manifest`, or the audit) and fail closed
+  otherwise; nothing may be derived from restricted or evaluation records. `generate_dataset_splits.py` makes seeded splits grouped
+  by physical sample (never by image), refuses evaluation and restricted data, and records every warning (small validation/test
+  split, missing category, unlabelled or conflicting samples, one image per sample) in the split file. `audit_dataset_leakage.py`
+  runs the full validation on every manifest (so an invalid manifest is an audit error), takes `--dataset-dir DATASET_ID=DIR`, and
+  reports identical content, cross-manifest derivations and capture sessions; its result is `PASS WITH LIMITATIONS` when identity
+  is unverified (assumed, one image per sample, schema 1.0) or a manifest's files were not verified. An
+  `assumed_each_image_distinct` identity is never treated as verified and the splitter needs a written reason
+  (`--accept-unverified-sample-identity REASON`), recorded in the split file; `inferred_by_documented_analysis` needs notes. All
+  tools exit 2 on any failure with a message, never a traceback (hostile JSON, custom schemas and unexpected errors included).
+  See `docs/dataset_workflow.md`. Not covered: near-duplicate images (perceptual hash/embeddings), wrongly assigned physical sample
+  IDs, image contents, the dataset registry, and whether any licence actually permits a use.
+  Schema 1.0 manifests get the structure and cross-record checks but can never be cleared for a use (no permission data) and
+  have no checksums. `format: date-time` is still unenforced for 1.0 (no `date-time` checker without `rfc3339-validator`);
+  1.1 checks timestamps with a pattern plus a calendar check.- The registry (`Dataset`) and the manifest are separate, unlinked definitions with different names and types: registry
   `dataset_name`/`source_name`/`source_url`/`doi`/`licence` (single string) versus manifest `dataset.name`/`source.name`/
   `source.reference`/`source.licence{name,reference,usage_notes}`; registry `dataset_id` is a server UUID, manifest
   `dataset_id` is a free string. The registry stores no manifest path, hash or schema version, and the app never imports
   the validator. The registry accepts any licence text (including "Unknown; use not authorized") and has no
   review/approval status.
-- Manifest `sample_id`/`image_id` are free strings in a dataset's own namespace. Never treat them as `Sample.id` /
-  `SampleImage.id`, and do not import public images as `Sample` rows (they would need placeholder values for NOT NULL
-  fields). `relative_path` has two meanings: in manifests (base directory undefined; the example implies `data/`) and in
-  `SampleImage.relative_path` (relative to the upload directory).
-- Laboratory measurements in the manifest hang off images and carry only measurement/value/unit/method. They belong to
-  physical samples and need standard, date, laboratory and uncertainty before real use.
+- Manifest `sample_id`/`image_id` (1.1: `physical_sample_id`/`record_id`) are identifiers in a dataset's own namespace. Never
+  treat them as `Sample.id` / `SampleImage.id`, and do not import public images as `Sample` rows (they would need placeholder
+  values for NOT NULL fields). `relative_path` has two meanings: in manifests (1.1: relative to the dataset directory passed to
+  `--dataset-dir`; 1.0: base directory undefined, the example implies `data/`) and in `SampleImage.relative_path` (relative to
+  the upload directory).
+- Laboratory measurements in schema 1.0 hang off images and carry only measurement/value/unit/method; schema 1.1 omits them. They
+  belong to physical samples and need standard, date, laboratory and uncertainty before real use.
 - `.gitignore` excludes `data/datasets/manifests/*`, so real manifests (provenance records) are not version-controlled;
   how to track reviewed manifests while keeping restricted evaluation labels out of Git is an open decision for the owner.
 
@@ -224,16 +261,21 @@ cd apps\api
 ..\..\.venv\Scripts\python.exe -m pytest -v
 ```
 
-Verified 2026-11-06: **46 passed** in about 7 s with one Starlette deprecation warning (`httpx` with
-`starlette.testclient`). Bare `pytest` and runs from the repo root fail with `ModuleNotFoundError: No module named 'app'`
+Verified 2026-11-10 (Milestone 2B remediation after the independent audit): **703 passed, 3 skipped** with one Starlette deprecation warning (`httpx`
+with `starlette.testclient`); the run takes from about 1.5 to 5 minutes depending on machine load. The three skips are
+platform-bound: a newline in a file name (cannot exist on Windows), two names differing only in case (cannot exist on a
+case-insensitive file system), and a real symbolic link (this Windows account cannot create one; a scripted directory entry covers it). Bare `pytest` and runs from the repo root fail with `ModuleNotFoundError: No module named 'app'`
 because there is no pytest configuration (no `pytest.ini`/`pyproject.toml`) and tests import `app.*` and `scripts.*`.
 If the count changes, update this line.
 
-Validate a manifest (exit 0 valid; **exit 2 for any failure**, including a missing file, because it uses `argparse` errors):
+Validate a manifest (exit 0 valid; **exit 2 for any failure**, including a missing file or unreadable JSON):
 
 ```powershell
-.\.venv\Scripts\python.exe apps\api\scripts\validate_dataset_manifest.py docs\examples\example_dataset_manifest.json
+.\.venv\Scripts\python.exe apps\api\scripts\validate_dataset_manifest.py docs\examples\example_dataset_manifest_1_1.json
 ```
+
+The split generator and leakage audit use the same exit codes; their commands, and the `--dataset-dir`, `--use` and `--seed`
+options, are in `docs/dataset_workflow.md`. The scripts run by file path from any directory.
 
 Run the API (import verified; the server was not started during the audit): from `apps/api`,
 `..\..\.venv\Scripts\python.exe -m uvicorn app.main:app`. Starting it opens and runs `create_all` on the real
@@ -250,8 +292,9 @@ Expectations:
   traversal-style filenames, and cleanup when storage or the DB fails.
 - Known coverage gaps (do not claim these are tested): empty/header-only/exact-limit uploads, missing `image` field, content-type
   `None`/`octet-stream`, DB-failure file cleanup, DOI-only and DOI-casefold duplicates in isolation (the existing 409 test also
-  matches on `source_url`), the `IntegrityError` branch in `dataset_service`, list ordering with several rows, manifest
-  `captured_at`, duplicate image ids, absolute/drive-letter `relative_path`, validator CLI exit codes.
+  matches on `source_url`), the `IntegrityError` branch in `dataset_service`, list ordering with several rows, and for schema
+  1.0 manifests only: `captured_at` and absolute/drive-letter `relative_path` (schema 1.1 and the manifest scripts' exit
+  codes are covered by the Milestone 2B tests).
 - Run the **full** suite before reporting any change as done. Report counts, failures and warnings as they are.
   Do not weaken or delete a test to make it pass.
 
@@ -279,7 +322,7 @@ engineering requirement. Do not infer suitability when laboratory results or val
 thresholds, soil/aggregate classes or standards, claim regulatory compliance, or present model output as a professional engineering
 decision. No hard-coded engineering thresholds, classes or compliance claims exist in the repo today; keep it that way. Any future
 engineering evaluation belongs in `app/engineering`, any visual model behind `app/ml`, both invoked from services.
-UMaT evaluation samples are never training, tuning or validation data.
+UMaT/MN273 restricted material is never used for training, validation, testing or independent AI evaluation.
 
 ## 15. Implementing new milestones
 
@@ -301,12 +344,12 @@ uploads; decide how you will test it. Do not assume code is correct because it e
 ## Known issues register (audit of 2026-11-06; remove items as they are fixed)
 
 High — design gaps to settle before dataset import (not exploitable today; no import/training code exists):
-- Registry and manifest are unlinked and diverging; no dataset category/evaluation-only flag, so the UMaT separation is stated, not enforced.
-- No checksums or immutability enforcement for raw data; validator is schema-only (no leakage/duplicate/existence checks).
+- Registry and manifest are unlinked and diverging; the registry has no dataset category/evaluation-only flag (schema 1.1 manifests enforce the UMaT separation in the offline tools, the registry does not).
+- Schema 1.1 records checksums and the tools check them, duplicates and one-split-per-sample; raw-data immutability is still not enforced, near-duplicate (perceptual-hash/embedding) detection does not exist, and 1.0 manifests have no checksums.
 - Production blockers: no authentication/authorisation, CORS policy, rate limits, request-body limit or logging.
 
 Medium:
-- Manifest `format: date-time` silently not validated (verified).
+- Schema 1.0 manifest `format: date-time` silently not validated (verified); schema 1.1 checks timestamps.
 - Upload hardening gaps listed in section 10; non-atomic write; file deleted after a committed row when `refresh` fails.
 - No unit of work (repositories commit); layering inversions listed in section 8.
 - `create_all` only, no Alembic, unnamed constraints, SQLite foreign keys off.
