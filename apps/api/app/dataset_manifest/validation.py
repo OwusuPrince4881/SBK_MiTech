@@ -12,18 +12,34 @@ images are good, correctly labelled, free of near-duplicates, or lawfully
 usable: whether a licence permits a use is a human judgement.
 """
 
+import codecs
 import hashlib
+import os
 import re
 import unicodedata
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
-from datetime import date
+from collections.abc import Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from app.dataset_manifest.files import DirectoryScan, find_unmanifested, scan_directory
-from app.dataset_manifest.issues import Report, summarise_ids
-from app.dataset_manifest.restricted import refusal_message, restriction_of
+from app.dataset_manifest.files import (
+    CONTAINER_EXTENSIONS,
+    HEADER_BYTES,
+    MEDIA_EXTENSIONS,
+    DirectoryScan,
+    find_unmanifested,
+    looks_like_container,
+    looks_like_media,
+    scan_directory,
+)
+from app.dataset_manifest.issues import ERROR, Issue, Report, summarise_ids
+from app.dataset_manifest.restricted import (
+    RestrictedPathError,
+    lexical_restriction,
+    refusal_message,
+    restriction_of,
+)
 from app.dataset_manifest.schema import (
     SUPPORTED_VERSIONS,
     SchemaLoadError,
@@ -50,10 +66,40 @@ HASH_CHUNK_SIZE = 1024 * 1024
 ASSUMED_IDENTITY = "assumed_each_image_distinct"
 INFERRED_IDENTITY = "inferred_by_documented_analysis"
 RESTRICTED_CATEGORY = "umat_practical"
+FIELD_CATEGORY = "ghana_field"
 EVALUATION = "independent_evaluation"
 LISTED_NAMES = 20  # How many unmanifested file names a single message shows.
-# A best-effort tripwire on identifying text, in addition to the category and the path guard.
-RESTRICTED_TOKENS = re.compile(r"umat|mn[\s_\-]?273", re.IGNORECASE)
+# What a Ghana field dataset's governance record must say before the dataset can be approved.
+FIELD_PERMISSION_RESOLVED = "documented"
+FIELD_CONSENT_RESOLVED = ("obtained", "not_applicable")
+FIELD_LOCATION_RESOLVED = ("removed", "generalised", "exact_restricted")
+# A recorded basis, reference, name or snapshot must say something. These are the words of a
+# placeholder: text made only of them records nothing.
+PLACEHOLDER_WORDS = frozenset(
+    {
+        "n", "a", "na", "nan", "null", "none", "nil", "nothing", "empty", "blank", "tbd", "tba", "tbc",
+        "todo", "yes", "no", "ok", "okay", "unknown", "unspecified", "unnamed", "anonymous", "pending",
+        "required", "applicable", "not", "see", "above", "licence", "license", "same", "as", "permitted",
+        "allowed", "fine", "x", "xx", "xxx", "test", "text", "basis", "clause", "the", "of", "name",
+        "reviewer", "placeholder", "dummy", "example", "foo", "bar", "asdf", "qwerty", "abc", "abcd",
+        "lorem", "ipsum", "dolor", "sit", "amet", "me", "self", "user", "admin", "someone", "anyone",
+        "nobody",
+    }
+)
+MIN_BASIS_CHARACTERS = 8  # letters and digits, so "Clause 4.2" qualifies and "x" or "n/a" does not
+MIN_BASIS_DISTINCT = 4
+MIN_NAME_CHARACTERS = 3  # a recorded name or reference needs at least this many letters and digits
+BLANK_BYTES = b" \t\r\n\x0b\x0c\x00"
+# A licence snapshot is judged from its first megabyte: it must be real text, not media or an
+# archive or other binary content. The whole file is still hashed.
+SNAPSHOT_INSPECT_BYTES = 1024 * 1024
+TEXT_CONTROLS = "\t\n\r\f\v"  # the only control characters ordinary text may contain
+INVISIBLE_CATEGORIES = ("Cc", "Cf", "Cs", "Co", "Cn")
+
+
+def today_utc() -> date:
+    """Today's date in UTC. Evidence and review dates must not be later than this."""
+    return datetime.now(timezone.utc).date()
 
 
 @dataclass
@@ -75,14 +121,92 @@ class ValidationResult:
     single_image_samples: bool = False
     # Files in the dataset directory that the manifest does not list (full lists).
     unmanifested_images: list[str] = field(default_factory=list)
+    unmanifested_containers: list[str] = field(default_factory=list)
     unmanifested_other: list[str] = field(default_factory=list)
     links_not_followed: list[str] = field(default_factory=list)
     ignored_by_pattern: list[str] = field(default_factory=list)
     ignored_housekeeping: list[str] = field(default_factory=list)
+    # Every source dataset assessed while the derivations were checked (directly or through a
+    # chain), by dataset_id. Filled in by the top-level call only.
+    source_assessments: dict[str, "SourceAssessment"] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
         return self.report.ok
+
+
+@dataclass(frozen=True)
+class SourceAssessment:
+    """What validating a source manifest, and checking its files, says about using it as a source.
+
+    The manifest is validated in full, with the same sources, so a chain of derivations is
+    followed. When the caller bound the source to its dataset directory, its files are also
+    checked there exactly as `--dataset-dir` checks a manifest's own files: every listed record
+    file and the licence snapshot must exist with the recorded spelling and match its SHA-256,
+    the snapshot must be real text, and nothing unlisted, linked or restricted may be in the
+    directory. That verifies the integrity of the recorded evidence. It does not establish
+    that the licence permits a use, that the data is owned as recorded, or that recorded
+    consent is genuine: what the manifest records is still its own declaration.
+    """
+
+    assessed: bool  # False for a view that carries no manifest: nothing can be concluded
+    valid: bool = False
+    errors: tuple[str, ...] = ()  # "[code] message" for the first few validation errors
+    error_count: int = 0
+    category: str | None = None
+    permission_status: str | None = None  # None for schema 1.0, which records no permissions
+    permitted_uses: tuple[str, ...] = ()
+    has_licence_snapshot: bool = False
+    field_gaps: tuple[str, ...] = ()  # unresolved Ghana field governance, if the category is ghana_field
+    cycle: bool = False  # the source derives, directly or not, from the dataset being checked
+    # What the source records about commercial training ('permitted', 'not_permitted' or 'unknown'),
+    # and, when it records 'permitted', why that is not supported by its recorded basis (None if it is).
+    commercial_training: str | None = None
+    commercial_basis_problem: str | None = None
+    # The dataset directory the caller bound to this source, or None if none was supplied.
+    dataset_dir: str | None = None
+    files_checked: bool = False  # the files were checked in that directory
+    files_verified: bool = False  # they were checked and nothing was wrong
+    file_errors: tuple[str, ...] = ()  # "[code] message" for the first few file errors
+    file_error_count: int = 0
+    files_declared: int = 0  # record files plus the licence snapshot that the manifest lists
+
+
+@dataclass(frozen=True)
+class _FileCheck:
+    """The outcome of checking one manifest's files in one directory (see `_check_files`)."""
+
+    document: Any = field(repr=False, compare=False)  # the manifest that was checked, by identity
+    verified: bool
+    issues: tuple[Issue, ...]
+    declared: int
+    unmanifested_images: tuple[str, ...]
+    unmanifested_containers: tuple[str, ...]
+    unmanifested_other: tuple[str, ...]
+    links_not_followed: tuple[str, ...]
+    ignored_by_pattern: tuple[str, ...]
+    ignored_housekeeping: tuple[str, ...]
+
+
+@dataclass
+class ValidationRun:
+    """What the checks of one validation operation may share, and nothing that outlives it.
+
+    A run is created for each top-level `validate_document` call, and the audit creates one
+    for all the manifests it audits. It is dropped when that call returns: nothing is stored
+    on a view or anywhere else. Inside a run, a dataset directory's files are hashed once
+    however many derivations or audited manifests need them, and each source is validated
+    once per context. A later run re-reads and re-hashes everything, so a result is never
+    reused after a file has changed between two runs. Within a run, files are assumed not to
+    change while it is in progress; that time-of-check limit is documented.
+    """
+
+    # Ignore patterns for the unlisted-file check of a source directory. They never hide an
+    # image, a video, an archive or a link, so they cannot turn a failing check into a pass.
+    source_ignore_patterns: tuple[str, ...] = ()
+    files: dict[tuple[str, str, tuple[str, ...]], _FileCheck] = field(default_factory=dict)
+    assessments: dict[tuple[str, frozenset[str], frozenset[str], bool], SourceAssessment] = field(default_factory=dict)
+    assessed_sources: dict[str, SourceAssessment] = field(default_factory=dict)
 
 
 def validate_document(
@@ -95,6 +219,10 @@ def validate_document(
     manifest_path: Path | None = None,
     ignore_patterns: Sequence[str] = (),
     provenance_sources: Mapping[str, ManifestView] | None = None,
+    _assessing: frozenset[str] = frozenset(),
+    _inherited_uses: frozenset[str] = frozenset(),
+    _inherited_commercial: bool = False,
+    _run: ValidationRun | None = None,
 ) -> ValidationResult:
     """Validate a parsed manifest.
 
@@ -112,13 +240,36 @@ def validate_document(
 
     `provenance_sources` maps dataset IDs to the views of the other manifests a
     record may derive from. A derivation from a dataset that is not supplied
-    cannot be established and is an error.
+    cannot be established and is an error. Each source that a record derives from is
+    also validated in full (see `assess_source`): a derivation from a source that is
+    invalid, not approved, denied, unresolved Ghana field data, without a licence
+    snapshot, or not permitted for the use in question is refused. So is one whose
+    files and licence snapshot could not be verified: a source view carries the
+    dataset directory that the caller bound to it (`ManifestView.dataset_dir`), and its
+    files are checked there as `dataset_dir` checks this manifest's own. Directories
+    that are the same, or nested, are refused as ambiguous.
+
+    The private arguments are for the recursion only. `_assessing` holds the datasets
+    whose validation is already in progress, so that a chain of derivations that loops
+    back is caught instead of followed. `_inherited_uses` are the uses that a dataset
+    derived from this one is put to: this manifest's own sources must permit them too,
+    so a use cannot be laundered through an intermediate dataset. `_inherited_commercial`
+    is the same for commercial training: a dataset derived from this one is to be used for it,
+    so every source down the chain must permit it. `_run` is shared by the checks of one
+    operation (see `ValidationRun`).
+
+    Commercial training is inherited in the same way whenever it matters: when it is
+    requested (`require_commercial_training`), when it is inherited, and when this manifest
+    itself records commercial training as permitted, because a derived dataset cannot grant a
+    broader commercial permission than the data it was made from.
     """
     requested = set(uses)
-    unknown = requested - set(USES)
+    unknown = (requested | set(_inherited_uses)) - set(USES)
     if unknown:
         raise ValueError(f"Unknown use(s) {sorted(unknown)}; expected a subset of {list(USES)}.")
 
+    top_level = _run is None
+    run = _run if _run is not None else ValidationRun()
     report = Report()
     result = ValidationResult(report)
 
@@ -138,6 +289,9 @@ def validate_document(
         schemas = [load_schema(version)]
         if schema_path is not None:
             schemas.append(load_schema(version, schema_path))
+    except RestrictedPathError as error:
+        report.error("restricted-schema", str(error), "custom schema")
+        return result
     except SchemaLoadError as error:
         report.error("schema-unavailable", str(error))
         return result
@@ -146,6 +300,9 @@ def validate_document(
             check_structure(manifest, schema, report)
     except RecursionError:
         report.error("manifest-too-deep", "the manifest is nested too deeply to be checked.")
+        return result
+    except SchemaLoadError as error:  # a reference that cannot be resolved without going offline
+        report.error("schema-unavailable", str(error))
         return result
     report.issues = list(dict.fromkeys(report.issues))
     if not report.ok:
@@ -165,10 +322,20 @@ def validate_document(
     result.single_image_samples = len(view.records) >= 2 and result.sample_count == len(view.records)
 
     _check_restricted_material(manifest, view, report)
+    if top_level:
+        _check_dataset_directories(dataset_dir, view.dataset_id, provenance_sources, report)
     _check_evaluation_isolation(view, report)
     _check_ids_and_paths(view, report)
     _check_sample_splits(view, report)
-    _check_provenance(view, report, provenance_sources)
+    _check_provenance(
+        view,
+        report,
+        provenance_sources,
+        requested | set(_inherited_uses),
+        _assessing | {view.dataset_id},
+        run,
+        _commercial_reason(manifest, version, require_commercial_training, _inherited_commercial),
+    )
     if version == "1.1":
         result.sample_identity_basis = manifest["dataset"]["sample_identity"]["basis"]
         _check_checksums_and_filenames(manifest, view, report)
@@ -176,6 +343,7 @@ def validate_document(
         _check_public_requirements(manifest, report)
         _check_permissions(manifest, view, report)
         _check_licence_evidence(manifest, view, report)
+        _check_field_governance(manifest, view, report, bool(requested) or require_commercial_training)
         _check_labels(manifest, view, report)
         _check_sample_identity(manifest, result, report)
     else:
@@ -190,22 +358,40 @@ def validate_document(
         manifest, version, requested, require_commercial_training, dataset_dir is not None, report
     )
     if dataset_dir is not None:
-        result.files_verified = _verify_files(
-            manifest, view, dataset_dir, report, result, manifest_path, ignore_patterns
-        )
+        check = _check_files(run, manifest, view, dataset_dir, manifest_path, ignore_patterns)
+        report.issues.extend(check.issues)
+        result.files_verified = check.verified
+        result.unmanifested_images = list(check.unmanifested_images)
+        result.unmanifested_containers = list(check.unmanifested_containers)
+        result.unmanifested_other = list(check.unmanifested_other)
+        result.links_not_followed = list(check.links_not_followed)
+        result.ignored_by_pattern = list(check.ignored_by_pattern)
+        result.ignored_housekeeping = list(check.ignored_housekeeping)
 
     wants_clearance = bool(requested) or require_commercial_training
     if report.ok and version == "1.1" and wants_clearance and result.files_verified:
         result.cleared_uses = tuple(sorted(requested))
         result.commercial_training_cleared = require_commercial_training
+    if top_level:
+        result.source_assessments = dict(run.assessed_sources)
     return result
 
 
-def source_view(document: Any) -> ManifestView:
+def source_view(
+    document: Any, *, dataset_dir: Path | None = None, manifest_path: Path | None = None
+) -> ManifestView:
     """A view of another manifest, for checking derivations. Raises ValueError if it is unreadable.
 
-    Only the structure must be sound: a source manifest that is itself restricted or
-    otherwise invalid is still loaded, so that a derivation from it can be refused.
+    Only the structure must be sound to load it: a source manifest that is itself
+    restricted or otherwise invalid is still loaded, so that a derivation from it can be
+    refused. The view keeps the parsed manifest, and whether a derivation from it is
+    allowed is decided by validating that manifest in full (`assess_source`), not by this
+    structure-only reading.
+
+    `dataset_dir` binds the source to the directory its relative paths refer to. Only an
+    explicit binding is accepted (it is never inferred from where the manifest is), and
+    only a bound source can have its files and licence snapshot verified.
+    `manifest_path` is where the manifest was read from.
     """
     version = detect_version(document)
     if version not in SUPPORTED_VERSIONS:
@@ -217,7 +403,7 @@ def source_view(document: Any) -> ManifestView:
         raise ValueError(str(error) or "the manifest is nested too deeply") from error
     if not report.ok:
         raise ValueError(f"{len(report.errors)} structural error(s); first: {report.errors[0].message}")
-    return build_view(document, version)
+    return replace(build_view(document, version), dataset_dir=dataset_dir, manifest_path=manifest_path)
 
 # --- helpers ---------------------------------------------------------------
 
@@ -246,20 +432,6 @@ def _location(view: ManifestView, index: int) -> str:
 # --- restricted material and evaluation isolation (both schema versions) ---------
 
 
-def _identifying_strings(manifest: dict[str, Any], view: ManifestView) -> list[tuple[str, str]]:
-    dataset = manifest["dataset"]
-    items: list[tuple[str, Any]] = [
-        ("dataset.dataset_id", dataset.get("dataset_id")),
-        ("dataset.name", dataset.get("name")),
-    ]
-    source = dataset.get("source", {})
-    for key in ("name", "url", "custodian", "reference"):
-        items.append((f"dataset.source.{key}", source.get(key)))
-    for record in view.records:
-        items.append((f"{_location(view, record.index)}.relative_path", record.relative_path))
-    return [(location, text) for location, text in items if isinstance(text, str)]
-
-
 def _check_restricted_material(
     manifest: dict[str, Any], view: ManifestView, report: Report
 ) -> None:
@@ -279,21 +451,18 @@ def _check_restricted_material(
             "dataset.category",
         )
 
-    # The category is only a declaration, so also look at what the manifest identifies itself by.
-    hits = [
-        (location, text)
-        for location, text in _identifying_strings(manifest, view)
-        if RESTRICTED_TOKENS.search(text)
-    ]
+    # The category is only a declaration, so also look at every string the manifest contains.
+    hits = view.restricted_hits
     if hits:
-        shown = "; ".join(f"{location}={text!r}" for location, text in hits[:5])
+        shown = "; ".join(f"{location}={ascii(text)} [{name}]" for location, text, name in hits[:5])
         more = f" and {len(hits) - 5} more" if len(hits) > 5 else ""
         report.error(
             "restricted-material-suspected",
-            f"identifying text mentions UMaT or MN273 ({shown}{more}). UMaT/MN273 material must "
+            f"the manifest mentions UMaT or MN273 ({shown}{more}). UMaT/MN273 material must "
             "not be used for any AI purpose, and this tool does not rely on the declared "
             "category to protect it. If this is not restricted material, rename it so that it no "
-            "longer carries those names.",
+            "longer carries those names. This is a best-effort check of names: it is not proof "
+            "that a manifest or its files are free of restricted material.",
             "dataset",
         )
 
@@ -378,8 +547,329 @@ def _check_sample_splits(view: ManifestView, report: Report) -> None:
             )
 
 
+def assess_source(
+    view: ManifestView,
+    sources: Mapping[str, ManifestView] | None,
+    assessing: frozenset[str] = frozenset(),
+    *,
+    uses: Collection[str] = (),
+    commercial: bool = False,
+    run: ValidationRun | None = None,
+) -> SourceAssessment:
+    """Validate a source manifest in full, check its files, and summarise what that means.
+
+    This runs `validate_document` on the source's own manifest (with the same `sources`,
+    so a source that itself derives from something unfit is unfit too, all the way down
+    a chain), then reads its recorded permission status, permitted uses, licence snapshot
+    and, for Ghana field data, the unresolved safeguards. It never relies on the
+    structure-only view. `uses` are the uses the derived data is put to; the source's own
+    sources must permit them as well. `assessing` holds the datasets whose validation is
+    already in progress: meeting one of them again is a cycle.
+
+    If the caller bound the source to a dataset directory, its files are checked there
+    as `--dataset-dir` checks a manifest's own (see `SourceAssessment`). A source that
+    is restricted UMaT/MN273 material is never checked: its directory is not touched.
+    Results are kept in `run` for the rest of that one operation only.
+
+    File verification shows that the recorded evidence is intact. It does not make a
+    recorded status, licence or consent true: those remain the manifest's declarations.
+    """
+    if view.document is None:
+        return SourceAssessment(assessed=False)
+    if view.dataset_id in assessing:
+        return SourceAssessment(assessed=True, cycle=True)
+    run = run if run is not None else ValidationRun()
+    inherited = frozenset(uses)
+    key = (view.dataset_id, assessing, inherited, commercial)
+    cached = run.assessments.get(key)
+    if cached is not None:
+        return cached
+
+    outcome = validate_document(
+        view.document,
+        provenance_sources=sources,
+        _assessing=assessing,
+        _inherited_uses=inherited,
+        _inherited_commercial=commercial,
+        _run=run,
+    )
+    errors = outcome.report.errors
+    category = status = commercial_recorded = basis_problem = None
+    permitted: tuple[str, ...] = ()
+    has_snapshot = False
+    gaps: tuple[str, ...] = ()
+    document = view.document
+    structurally_sound = outcome.version == "1.1" and not any(issue.code == "schema" for issue in errors)
+    if structurally_sound:
+        dataset = document["dataset"]
+        category = dataset["category"]
+        status = dataset["permissions"]["status"]
+        permitted = tuple(sorted(dataset["permissions"]["permitted_uses"]))
+        has_snapshot = "snapshot" in dataset["licence"].get("evidence", {})
+        commercial_recorded = dataset["permissions"]["commercial_training"]
+        if commercial_recorded == "permitted":
+            basis = dataset["permissions"].get("commercial_training_basis")
+            if basis is None:
+                basis_problem = "it records no commercial_training_basis"
+            elif not _basis_is_meaningful(basis):
+                basis_problem = (
+                    "its commercial_training_basis is a placeholder or too thin to name a licence clause "
+                    "or permission document"
+                )
+        if category == FIELD_CATEGORY:
+            gaps = tuple(_field_governance_gaps(dataset.get("field_governance")))
+
+    files: dict[str, Any] = {}
+    if view.dataset_dir is not None:
+        files["dataset_dir"] = str(view.dataset_dir)
+        restricted = view.category == RESTRICTED_CATEGORY or bool(view.restricted_hits)
+        if structurally_sound and not restricted:
+            check = _check_files(
+                run, document, view, view.dataset_dir, view.manifest_path, run.source_ignore_patterns
+            )
+            file_errors = [issue for issue in check.issues if issue.severity == ERROR]
+            files.update(
+                files_checked=True,
+                files_verified=check.verified and not file_errors,
+                file_errors=tuple(f"[{issue.code}] {issue.message}"[:240] for issue in file_errors[:3]),
+                file_error_count=len(file_errors),
+                files_declared=check.declared,
+            )
+    assessment = SourceAssessment(
+        assessed=True,
+        valid=outcome.ok,
+        errors=tuple(f"[{issue.code}] {issue.message}"[:240] for issue in errors[:3]),
+        error_count=len(errors),
+        category=category,
+        permission_status=status,
+        permitted_uses=permitted,
+        has_licence_snapshot=has_snapshot,
+        field_gaps=gaps,
+        commercial_training=commercial_recorded,
+        commercial_basis_problem=basis_problem,
+        **files,
+    )
+    run.assessments[key] = assessment
+    run.assessed_sources.setdefault(view.dataset_id, assessment)
+    return assessment
+
+
+def _check_source_governance(
+    view: ManifestView,
+    source_dataset: str,
+    pairs: Sequence[tuple[RecordView, RecordView]],
+    sources: Mapping[str, ManifestView],
+    requested: Collection[str],
+    assessing: frozenset[str],
+    report: Report,
+    run: ValidationRun,
+    commercial: str | None = None,
+) -> None:
+    """A source must itself be fit to be used, and its evidence intact, before anything derived from it can be.
+
+    `commercial` says why the sources must also permit commercial training (it is requested,
+    inherited from a dataset derived from this one, or recorded as permitted here), or is None.
+
+    `pairs` are the (derived record, source record) derivations from one source dataset.
+    The source is validated in full and its files are checked in the directory bound to it,
+    once. Its problems are errors when the derived data is in use (a record has a split, a use
+    was requested, or the manifest records itself as approved or lists permitted uses) and
+    warnings while everything is still a draft. Evaluation-related rules are reported
+    separately, by `_check_cross_dataset_derivation`, and are not repeated here.
+    """
+    source = sources[source_dataset]
+    if source.category == RESTRICTED_CATEGORY or source.restricted_hits:
+        return  # refused outright, record by record, as restricted material; its files are never read
+    first = pairs[0][0]
+    location = f"{_location(view, first.index)}.provenance.derived_from"
+    count = len(pairs)
+    who = f"{count} record(s) derive from dataset {source_dataset!r}"
+
+    # The derived data is in use if it says so: a requested use, a record with a split, or a
+    # manifest that records itself as approved or lists permitted uses. Until then it is a draft.
+    in_use = bool(requested) or any(record.split != UNASSIGNED for record in view.records)
+    if view.version == "1.1" and view.document is not None:
+        permissions = view.document["dataset"]["permissions"]
+        in_use = in_use or permissions["status"] == "approved" or bool(permissions["permitted_uses"])
+    # Pairs that involve an evaluation record are refused by the evaluation rules, so they
+    # are not judged again here.
+    ordinary = [pair for pair in pairs if EVALUATION not in (pair[0].split, pair[1].split)]
+    needed: set[str] = set(requested) if ordinary else set()
+    for record, _source_record in ordinary:
+        if record.split in SPLIT_TO_USE:
+            needed.add(SPLIT_TO_USE[record.split])
+
+    # Commercial training is training, and it is passed down the chain like any other use.
+    needs_commercial = commercial is not None and bool(ordinary)
+    if needs_commercial:
+        needed.add("training")
+        in_use = True
+    assessment = assess_source(source, sources, assessing, uses=needed, commercial=needs_commercial, run=run)
+    if not assessment.assessed:
+        report.error(
+            "derived-source-unassessed",
+            f"{who}, but the source is a view without its manifest, so it cannot be validated and "
+            "nothing can be concluded about its permission or governance. Supply the source "
+            "manifest itself.",
+            location,
+        )
+        return
+    if assessment.cycle:
+        report.error(
+            "derivation-cycle",
+            f"{who}, which derives, directly or through other datasets, from this one. Derivations "
+            "may not form a loop.",
+            location,
+        )
+        return
+
+    problems: list[tuple[str, str]] = []
+    if not assessment.valid:
+        shown = "; ".join(assessment.errors)
+        problems.append(
+            (
+                "derived-from-invalid-source",
+                f"the manifest of dataset {source_dataset!r} does not validate "
+                f"({assessment.error_count} error(s)); first: {shown}",
+            )
+        )
+    if assessment.permission_status is None:
+        problems.append(
+            (
+                "derived-from-source-without-permission-data",
+                f"dataset {source_dataset!r} is a schema 1.0 manifest, which records no permissions, "
+                "so it cannot be cleared for any use and nothing may be derived from it for one",
+            )
+        )
+    elif assessment.permission_status == "denied":
+        problems.append(
+            (
+                "derived-from-denied-source",
+                f"dataset {source_dataset!r} records its permission status as 'denied'",
+            )
+        )
+    elif assessment.permission_status != "approved":
+        problems.append(
+            (
+                "derived-from-unapproved-source",
+                f"dataset {source_dataset!r} records its permission status as "
+                f"{assessment.permission_status!r}, not 'approved'",
+            )
+        )
+    if assessment.category == FIELD_CATEGORY and assessment.field_gaps:
+        problems.append(
+            (
+                "derived-from-unresolved-field-source",
+                f"dataset {source_dataset!r} is Ghana field data whose safeguards are unresolved: "
+                + "; ".join(assessment.field_gaps),
+            )
+        )
+    if assessment.permission_status == "approved":
+        if not assessment.has_licence_snapshot:
+            problems.append(
+                (
+                    "derived-from-source-without-licence-snapshot",
+                    f"dataset {source_dataset!r} is recorded as approved but preserves no checksummed "
+                    "licence snapshot (licence.evidence.snapshot), which a use needs",
+                )
+            )
+        missing = sorted(needed - set(assessment.permitted_uses))
+        if missing:
+            problems.append(
+                (
+                    "derived-from-source-use-not-permitted",
+                    f"dataset {source_dataset!r} does not record {missing} among its permitted uses "
+                    f"({list(assessment.permitted_uses)})",
+                )
+            )
+    # A derived dataset can be cleared for, or record, commercial training only if every source permits it.
+    if needs_commercial and assessment.permission_status is not None:
+        recorded = assessment.commercial_training
+        if recorded == "not_permitted":
+            problems.append(
+                (
+                    "derived-from-source-commercial-training-denied",
+                    f"{commercial}, and dataset {source_dataset!r} records commercial training as "
+                    "'not_permitted'. A dataset cannot be cleared for, or record, commercial training "
+                    "when a source it derives from denies it",
+                )
+            )
+        elif recorded != "permitted":
+            problems.append(
+                (
+                    "derived-from-source-commercial-training-not-permitted",
+                    f"{commercial}, and dataset {source_dataset!r} records commercial training as "
+                    f"{recorded!r}, not 'permitted'. 'unknown' is not permission, and a derived dataset "
+                    "cannot have a broader commercial permission than its source",
+                )
+            )
+        elif assessment.commercial_basis_problem is not None:
+            problems.append(
+                (
+                    "derived-from-source-commercial-training-unsupported",
+                    f"{commercial}, and dataset {source_dataset!r} records commercial training as "
+                    f"permitted, but {assessment.commercial_basis_problem}, so that permission is not "
+                    "supported by its recorded evidence",
+                )
+            )
+    # A manifest's declaration that its files and licence snapshot exist is not evidence that
+    # they do. A schema 1.0 source records no checksums and is refused above in any case.
+    if assessment.permission_status is not None:
+        if assessment.dataset_dir is None:
+            problems.append(
+                (
+                    "derived-from-source-files-not-verified",
+                    f"no dataset directory was supplied for dataset {source_dataset!r}, so its record "
+                    "files and licence snapshot were not checked against its manifest. A manifest that "
+                    "lists files is not evidence that they exist or are unchanged. Supply the directory "
+                    f"with --source-dataset-dir {source_dataset}=DIRECTORY (the audit: --dataset-dir "
+                    f"{source_dataset}=DIRECTORY)",
+                )
+            )
+        elif not assessment.files_verified:
+            shown = "; ".join(assessment.file_errors) or "the directory could not be checked"
+            problems.append(
+                (
+                    "derived-from-source-files-invalid",
+                    f"the files of dataset {source_dataset!r} in '{assessment.dataset_dir}' do not match "
+                    f"its manifest ({assessment.file_error_count} error(s)); first: {shown}",
+                )
+            )
+
+    if assessment.files_verified:
+        snapshot = assessment.has_licence_snapshot
+        note = (
+            f" The source's {assessment.files_declared} listed file(s)"
+            + (", its licence snapshot among them," if snapshot else " (it lists no licence snapshot)")
+            + f" were checked in '{assessment.dataset_dir}': each exists and matches its recorded SHA-256"
+            + (", and the snapshot is real text" if snapshot else "")
+            + ". That shows the recorded evidence is intact, not that the licence permits the use or "
+            "that what the source records (permission, consent) is true: that is declared, not "
+            "independently verified."
+        )
+    else:
+        note = (
+            " The source's files and licence snapshot were NOT verified, and everything it records is "
+            "declared, not independently verified."
+        )
+    for code, text in problems:
+        message = f"{who}, but {text}.{note}"
+        if in_use:
+            report.error(code, message, location)
+        else:
+            report.warn(
+                code, message + " This is a warning while everything is unassigned and no use is requested.", location
+            )
+
+
 def _check_provenance(
-    view: ManifestView, report: Report, sources: Mapping[str, ManifestView] | None
+    view: ManifestView,
+    report: Report,
+    sources: Mapping[str, ManifestView] | None,
+    requested: Collection[str],
+    assessing: frozenset[str],
+    run: ValidationRun,
+    commercial: str | None = None,
 ) -> None:
     """Every declared derivation must be traceable; one that cannot be traced fails closed."""
     by_id = view.records_by_id()
@@ -387,6 +877,7 @@ def _check_provenance(
     for dataset_id, source_view in (sources or {}).items():
         if dataset_id != view.dataset_id:
             other_records[dataset_id] = source_view.records_by_id()
+    derived_from: dict[str, list[tuple[RecordView, RecordView]]] = {}
 
     for record in view.records:
         location = f"{_location(view, record.index)}.provenance.derived_from"
@@ -429,9 +920,81 @@ def _check_provenance(
                     location,
                 )
                 continue
+            derived_from.setdefault(source_dataset, []).append((record, source))
             _check_cross_dataset_derivation(
                 record, source, sources[source_dataset], source_dataset, location, report
             )
+
+    # Each source is judged once, however many records derive from it.
+    for source_dataset, pairs in derived_from.items():
+        _check_source_governance(
+            view, source_dataset, pairs, sources or {}, requested, assessing, report, run, commercial
+        )
+
+
+def _commercial_reason(manifest: Any, version: str, requested: bool, inherited: bool) -> str | None:
+    """Why this dataset's sources must permit commercial training, or None if they need not."""
+    if requested:
+        return "commercial training was requested for this dataset"
+    if inherited:
+        return "a dataset derived from this one is to be used for commercial training"
+    if version == "1.1" and manifest["dataset"]["permissions"]["commercial_training"] == "permitted":
+        return "this dataset records commercial training as permitted"
+    return None
+
+
+def directory_binding_problems(entries: Sequence[tuple[str, Path]]) -> list[str]:
+    """Messages for every pair of dataset directories that are the same or nested.
+
+    `entries` are (who, directory), for example ("this dataset", ...) and ("source 'a'", ...).
+    Two datasets checked in one directory, or one inside the other, would count the files of
+    one as files of the other, or hide them, so the binding is ambiguous and refused. Links are
+    followed and letter case is ignored where the file system ignores it. A directory in a
+    restricted location is not resolved here: it is refused where it is checked, before
+    anything in it is touched.
+    """
+    resolved: list[tuple[str, Path, str]] = []
+    for who, path in entries:
+        if lexical_restriction(path) is not None:
+            continue
+        try:
+            real = os.path.realpath(os.fspath(path))
+        except (OSError, ValueError, RuntimeError):
+            real = os.path.abspath(os.fspath(path))
+        resolved.append((who, path, os.path.normcase(real)))
+    problems: list[str] = []
+    for index, (who, path, real) in enumerate(resolved):
+        for other_who, other_path, other_real in resolved[index + 1 :]:
+            if _same_or_inside(real, other_real) or _same_or_inside(other_real, real):
+                problems.append(
+                    f"the dataset directory of {who} ('{path}') and that of {other_who} ('{other_path}') "
+                    "are the same directory, or one is inside the other. Each dataset is checked in a "
+                    "directory of its own; otherwise the files of one would be counted, or hidden, as "
+                    "files of the other. Give each dataset its own directory."
+                )
+    return problems
+
+
+def _same_or_inside(outer: str, inner: str) -> bool:
+    try:
+        return os.path.commonpath([outer, inner]) == outer
+    except ValueError:  # on different drives
+        return False
+
+
+def _check_dataset_directories(
+    dataset_dir: Path | None, own_id: str, sources: Mapping[str, ManifestView] | None, report: Report
+) -> None:
+    """The directories bound to this manifest and to its sources must be distinct and not nested."""
+    entries: list[tuple[str, Path]] = []
+    if dataset_dir is not None:
+        entries.append(("this dataset", dataset_dir))
+    for dataset_id in sorted(sources or {}):
+        bound = (sources or {})[dataset_id].dataset_dir
+        if dataset_id != own_id and bound is not None:
+            entries.append((f"source {dataset_id!r}", bound))
+    for problem in directory_binding_problems(entries):
+        report.error("ambiguous-dataset-directory", problem, "dataset directories")
 
 
 def _check_cross_dataset_derivation(
@@ -444,11 +1007,12 @@ def _check_cross_dataset_derivation(
 ) -> None:
     derived_split, source_split = record.split, source.split
     where = f"{source.record_id!r} of dataset {source_dataset!r} ({source_split})"
-    if source_view.category == RESTRICTED_CATEGORY:
+    if source_view.category == RESTRICTED_CATEGORY or source_view.restricted_hits:
         report.error(
             "derived-from-restricted-source",
-            f"record derives from {where}, which is restricted UMaT/MN273 material. Nothing may "
-            "be derived from it.",
+            f"record derives from {where}, which is restricted UMaT/MN273 material (its manifest "
+            "has the category 'umat_practical' or carries those names). Nothing may be derived "
+            "from it.",
             location,
         )
     elif source_split == EVALUATION and derived_split != EVALUATION:
@@ -521,12 +1085,23 @@ def _calendar_valid(value: str) -> bool:
 
 def _check_dates(manifest: dict[str, Any], report: Report) -> None:
     dataset = manifest["dataset"]
-    candidates = [
-        ("dataset.source.retrieved_on", dataset["source"].get("retrieved_on")),
-        ("dataset.permissions.reviewed_on", dataset["permissions"].get("reviewed_on")),
+    governance = dataset.get("field_governance", {})
+    # (location, value, may not be later than today). Evidence, review and retrieval dates
+    # record something that has already happened; a camera clock or annotation date is not
+    # judged that way.
+    candidates: list[tuple[str, Any, bool]] = [
+        ("dataset.source.retrieved_on", dataset["source"].get("retrieved_on"), True),
+        ("dataset.permissions.reviewed_on", dataset["permissions"].get("reviewed_on"), True),
         (
             "dataset.licence.evidence.captured_on",
             dataset["licence"].get("evidence", {}).get("captured_on"),
+            True,
+        ),
+        ("dataset.field_governance.reviewed_on", governance.get("reviewed_on"), True),
+        (
+            "dataset.field_governance.collection_permission.recorded_on",
+            governance.get("collection_permission", {}).get("recorded_on"),
+            True,
         ),
     ]
     for index, record in enumerate(manifest["records"]):
@@ -534,17 +1109,29 @@ def _check_dates(manifest: dict[str, Any], report: Report) -> None:
             (
                 f"records[{index}].acquisition.captured_at",
                 record.get("acquisition", {}).get("captured_at"),
+                False,
             )
         )
         candidates.append(
             (
                 f"records[{index}].label.source.annotated_on",
                 record.get("label", {}).get("source", {}).get("annotated_on"),
+                False,
             )
         )
-    for location, value in candidates:
-        if value is not None and not _calendar_valid(value):
+    today = today_utc()
+    for location, value, not_in_future in candidates:
+        if value is None:
+            continue
+        if not _calendar_valid(value):
             report.error("invalid-date", f"{value!r} is not a real calendar date.", location)
+        elif not_in_future and date.fromisoformat(value[:10]) > today:
+            report.error(
+                "date-in-future",
+                f"{value!r} is later than today ({today.isoformat()}, UTC). An evidence, review or "
+                "retrieval date records something that has already happened.",
+                location,
+            )
 
 
 def _check_public_requirements(manifest: dict[str, Any], report: Report) -> None:
@@ -612,6 +1199,51 @@ def _check_permissions(manifest: dict[str, Any], view: ManifestView, report: Rep
             )
 
 
+def _basis_is_meaningful(text: str) -> bool:
+    """A plausibility check on a commercial-training basis, not a legal judgement.
+
+    It rejects what cannot name a licence clause or permission document: placeholders
+    ("x", "n/a", "TBD", "yes", "see licence"), text with fewer than 8 letters and digits
+    in all, and text built from fewer than 4 different characters. Text that passes can
+    still be wrong: nothing here reads the licence.
+    """
+    return _text_problem(text) is None
+
+
+def _tokens(text: str) -> list[str]:
+    """The words of `text`: runs of letters and digits in any script, case folded."""
+    return re.findall(r"[^\W_]+", unicodedata.normalize("NFKC", text).casefold())
+
+
+def _text_problem(text: str) -> str | None:
+    """Why `text` cannot be a specific statement (a basis, a reason, a restriction), or None."""
+    tokens = _tokens(text)
+    joined = "".join(tokens)
+    if not joined:
+        return "holds no letters or digits"
+    if all(token in PLACEHOLDER_WORDS for token in tokens):
+        return "is a placeholder, not a recorded statement"
+    if len(joined) < MIN_BASIS_CHARACTERS or len(set(joined)) < MIN_BASIS_DISTINCT:
+        return (
+            f"is too short or too repetitive to say anything specific (it needs at least "
+            f"{MIN_BASIS_CHARACTERS} letters and digits)"
+        )
+    return None
+
+
+def _name_problem(text: str) -> str | None:
+    """Why `text` cannot name a person, body, document or value (a recorded name or reference)."""
+    tokens = _tokens(text)
+    joined = "".join(tokens)
+    if not joined:
+        return "holds no letters or digits"
+    if all(token in PLACEHOLDER_WORDS for token in tokens) or len(set(joined)) == 1:
+        return "is a placeholder, not a recorded value"
+    if len(joined) < MIN_NAME_CHARACTERS:
+        return f"is too short to identify anything (it needs at least {MIN_NAME_CHARACTERS} letters and digits)"
+    return None
+
+
 def _check_licence_evidence(manifest: dict[str, Any], view: ManifestView, report: Report) -> None:
     """Approval must be backed by preserved evidence; the tool checks it is recorded, not its merit."""
     dataset = manifest["dataset"]
@@ -633,6 +1265,18 @@ def _check_licence_evidence(manifest: dict[str, Any], view: ManifestView, report
             "commercial-training-basis-missing",
             "commercial_training is 'permitted' but commercial_training_basis does not say "
             "which licence clause or permission document allows it.",
+            "dataset.permissions.commercial_training_basis",
+        )
+    elif permissions["commercial_training"] == "permitted" and not _basis_is_meaningful(
+        permissions["commercial_training_basis"]
+    ):
+        report.error(
+            "commercial-training-basis-not-meaningful",
+            "commercial_training is 'permitted' but commercial_training_basis does not name a "
+            "licence clause or permission document: it needs at least 8 letters and digits, must "
+            "not be a placeholder such as 'x', 'n/a', 'TBD' or 'see licence', and must not be "
+            "made of repeated characters. This is a plausibility check on the text; it does not "
+            "establish that the licence permits commercial training.",
             "dataset.permissions.commercial_training_basis",
         )
 
@@ -663,6 +1307,152 @@ def _check_licence_evidence(manifest: dict[str, Any], view: ManifestView, report
                 "record's path; keep them as separate files.",
                 "dataset.licence.evidence.snapshot.relative_path",
             )
+
+
+# The recorded text of a Ghana field governance record. "name" fields identify a person, body or
+# document (a short value is fine, a placeholder is not); "text" fields explain something and
+# must say something specific.
+_GOVERNANCE_TEXT_FIELDS: tuple[tuple[tuple[str, ...], str, str], ...] = (
+    (("collection_permission", "granted_by"), "name", "collection permission 'granted_by'"),
+    (("collection_permission", "reference"), "name", "collection permission 'reference'"),
+    (("consent", "basis"), "text", "consent 'basis'"),
+    (("consent", "reference"), "name", "consent 'reference'"),
+    (("location_privacy", "precision"), "name", "location 'precision'"),
+    (("location_privacy", "access_restriction"), "text", "location 'access_restriction'"),
+    (("location_privacy", "notes"), "text", "location privacy 'notes'"),
+    (("reviewed_by",), "name", "'reviewed_by'"),
+)
+
+
+def _placeholder_gaps(governance: dict[str, Any]) -> list[str]:
+    """Recorded governance text that is blank, a placeholder, or too thin to be a record."""
+    gaps: list[str] = []
+    for path, kind, label in _GOVERNANCE_TEXT_FIELDS:
+        value: Any = governance
+        for key in path:
+            value = value.get(key) if isinstance(value, dict) else None
+        if not isinstance(value, str):
+            continue  # absent: reported elsewhere, when the safeguard needs it
+        problem = _name_problem(value) if kind == "name" else _text_problem(value)
+        if problem is not None:
+            gaps.append(f"{label} {problem}")
+    return gaps
+
+
+def _field_governance_gaps(governance: dict[str, Any] | None) -> list[str]:
+    """What is still missing or unresolved in a Ghana field dataset's governance record.
+
+    A gap is only ever reported: nothing is filled in, defaulted or assumed. A value that is
+    present but is a placeholder ("x", "n/a", "none", "unknown", "yes", blank or invisible text)
+    records nothing, so it is a gap too.
+    """
+    if governance is None:
+        return ["no field_governance record is present"]
+    gaps: list[str] = []
+    permission = governance["collection_permission"]
+    if permission["status"] != FIELD_PERMISSION_RESOLVED:
+        gaps.append(f"collection permission is {permission['status']!r}, not 'documented'")
+    else:
+        for key in ("granted_by", "reference", "recorded_on"):
+            if key not in permission:
+                gaps.append(f"collection permission is 'documented' but {key} is not recorded")
+    consent = governance["consent"]
+    if consent["status"] not in FIELD_CONSENT_RESOLVED:
+        gaps.append(f"consent is {consent['status']!r}, not 'obtained' or 'not_applicable'")
+    elif "basis" not in consent:
+        gaps.append(
+            "consent is recorded as resolved but its basis (who consented, or why consent does "
+            "not apply) is not recorded"
+        )
+    location = governance["location_privacy"]
+    handling = location["handling"]
+    if handling not in FIELD_LOCATION_RESOLVED:
+        gaps.append("location privacy handling is 'unresolved'")
+    elif handling == "generalised" and "precision" not in location:
+        gaps.append("location is 'generalised' but the precision that is kept is not recorded")
+    elif handling == "exact_restricted" and "access_restriction" not in location:
+        gaps.append("exact locations are kept but how access to them is restricted is not recorded")
+    if "reviewed_by" not in governance or "reviewed_on" not in governance:
+        gaps.append("no responsible reviewer and review date are recorded")
+    if not governance.get("permitted_uses"):
+        gaps.append("no permitted uses are recorded for the field permission and consent")
+    gaps.extend(_placeholder_gaps(governance))
+    return gaps
+
+
+def _check_field_governance(
+    manifest: dict[str, Any], view: ManifestView, report: Report, use_requested: bool
+) -> None:
+    """Ghana field data fails closed: nothing is approved, split or used until it is documented.
+
+    The record is what the project says happened (permission obtained, consent obtained
+    or not applicable, location handled, a named reviewer). This tool cannot check that any
+    of it is true, and it never fills a gap in: a missing or unresolved safeguard is
+    reported as it is.
+    """
+    dataset = manifest["dataset"]
+    governance = dataset.get("field_governance")
+    if dataset["category"] != FIELD_CATEGORY:
+        if governance is not None:
+            report.error(
+                "field-governance-not-applicable",
+                "field_governance describes the collection of Ghana field data and may only be "
+                "recorded when the category is 'ghana_field'.",
+                "dataset.field_governance",
+            )
+        return
+
+    permissions = dataset["permissions"]
+    gaps = _field_governance_gaps(governance)
+    if gaps:
+        claims_use = (
+            permissions["status"] == "approved"
+            or bool(permissions["permitted_uses"])
+            or any(record.split != UNASSIGNED for record in view.records)
+            or use_requested
+        )
+        message = (
+            "Ghana field data must not be approved, assigned to a split or used for any AI "
+            "purpose until the collection permission, consent and location privacy are "
+            "documented and reviewed (see docs/ghana_field_governance.md). Unresolved: "
+            + "; ".join(gaps)
+            + ". Whatever is recorded is the manifest's own declaration; this tool does not "
+            "independently verify it, and it never fills in a missing value."
+        )
+        if claims_use:
+            report.error("field-governance-unresolved", message, "dataset.field_governance")
+        else:
+            report.warn(
+                "field-governance-unresolved",
+                message + " Nothing can be cleared for this dataset while they are unresolved.",
+                "dataset.field_governance",
+            )
+        return
+
+    if governance is None:  # unreachable: `gaps` is empty only when a record is present
+        return
+    extra = sorted(set(permissions["permitted_uses"]) - set(governance["permitted_uses"]))
+    if extra:
+        report.error(
+            "use-exceeds-field-permission",
+            f"dataset.permissions.permitted_uses allows {extra}, which the field permission and "
+            f"consent do not cover (field_governance.permitted_uses is "
+            f"{sorted(governance['permitted_uses'])}).",
+            "dataset.permissions.permitted_uses",
+        )
+    recorded_on = governance["collection_permission"]["recorded_on"]
+    reviewed_on = governance["reviewed_on"]
+    if (
+        _calendar_valid(recorded_on)
+        and _calendar_valid(reviewed_on)
+        and recorded_on[:10] > reviewed_on[:10]
+    ):
+        report.error(
+            "field-permission-after-review",
+            f"the collection permission was recorded on {recorded_on}, after the review on "
+            f"{reviewed_on}, so the review cannot have been based on it.",
+            "dataset.field_governance.collection_permission.recorded_on",
+        )
 
 
 def _check_labels(manifest: dict[str, Any], view: ManifestView, report: Report) -> None:
@@ -837,13 +1627,98 @@ def resolve_within(root: Path, relative_path: str) -> Path | None:
 
 
 def sha256_of_file(path: Path) -> tuple[str, int]:
+    digest, size, _has_content = _digest_file(path)
+    return digest, size
+
+
+def _digest_file(path: Path) -> tuple[str, int, bool]:
+    """(SHA-256, size, whether any byte is something other than whitespace or NUL)."""
     digest = hashlib.sha256()
     size = 0
+    has_content = False
     with path.open("rb") as handle:
         while chunk := handle.read(HASH_CHUNK_SIZE):
             digest.update(chunk)
             size += len(chunk)
-    return digest.hexdigest(), size
+            if not has_content and chunk.strip(BLANK_BYTES):
+                has_content = True
+    return digest.hexdigest(), size, has_content
+
+
+def _snapshot_problem(target: Path, relative_path: str, size: int) -> tuple[str, str] | None:
+    """Why a licence snapshot is not usable text, as (code, message), or None if it looks fine.
+
+    A snapshot preserves the licence text or permission document, so it must be text. It is
+    refused if it is recognised as an image, video, archive or other container (by its extension
+    or by its first bytes), if it is not valid UTF-8 (UTF-8 with or without a byte-order mark, or
+    UTF-16 with one) or holds control characters such as NUL (other binary content), if nothing
+    visible is left once a byte-order mark, whitespace and zero-width or other invisible
+    characters are ignored, or if what is there is a placeholder or too thin to be a document.
+
+    Detection is by extension and a few known signatures and is not complete: a binary format
+    this tool does not recognise is caught only because it is not UTF-8 text. Only the first
+    megabyte is inspected (the whole file is hashed). Whether the text is really the licence is
+    a human judgement.
+    """
+    try:
+        with target.open("rb") as handle:
+            head = handle.read(SNAPSHOT_INSPECT_BYTES)
+    except OSError:
+        return None  # the hashing pass has already reported the unreadable file
+    shown = ascii(relative_path)
+    suffix = PurePosixPath(relative_path).suffix.casefold()
+    recognised = None
+    if suffix in MEDIA_EXTENSIONS:
+        recognised = f"an image or video by its extension ({suffix})"
+    elif suffix in CONTAINER_EXTENSIONS:
+        recognised = f"an archive, document or other container by its extension ({suffix})"
+    elif looks_like_media(head[:HEADER_BYTES]):
+        recognised = "an image or video by its first bytes"
+    elif looks_like_container(head[:HEADER_BYTES]):
+        recognised = "an archive, document or other container by its first bytes"
+    if recognised is not None:
+        return (
+            "licence-snapshot-not-text",
+            f"the licence snapshot {shown} is recognised as {recognised}, not text. A snapshot must be "
+            "the licence text or permission document saved as plain UTF-8 text (a PDF or scan can be "
+            "transcribed to text, or kept elsewhere and cited as the evidence reference). Recognition "
+            "is by extension and a few known signatures and is not complete.",
+        )
+    if head.startswith(codecs.BOM_UTF8):
+        encoding = "utf-8-sig"
+    elif head.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        encoding = "utf-16"
+    else:
+        encoding = "utf-8"
+    decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
+    try:
+        text = decoder.decode(head, final=size <= len(head))
+    except UnicodeDecodeError:
+        return (
+            "licence-snapshot-not-text",
+            f"the licence snapshot {shown} is not UTF-8 text: it holds bytes that are not valid text, "
+            "which usually means a binary file. Save the licence as plain UTF-8 text.",
+        )
+    if any(unicodedata.category(c) == "Cc" and c not in TEXT_CONTROLS for c in text):
+        return (
+            "licence-snapshot-not-text",
+            f"the licence snapshot {shown} contains control characters (such as NUL) that text does "
+            "not, so it is binary content, not text.",
+        )
+    if not any(not c.isspace() and unicodedata.category(c) not in INVISIBLE_CATEGORIES for c in text):
+        return (
+            "licence-snapshot-empty",
+            f"the licence snapshot {shown} holds no visible text: only a byte-order mark, whitespace "
+            "or zero-width or other invisible characters. Save the actual licence text.",
+        )
+    thin = _text_problem(text)
+    if thin is not None:
+        return (
+            "licence-snapshot-meaningless",
+            f"the licence snapshot {shown} {thin}, so it cannot preserve a licence or permission "
+            "document. (The tool checks that real-looking text is there, not what it says.)",
+        )
+    return None
 
 
 @dataclass(frozen=True)
@@ -852,6 +1727,7 @@ class _DeclaredFile:
     location: str
     sha256: str | None
     size_bytes: int | None
+    is_licence_snapshot: bool = False
 
 
 def _declared_files(manifest: dict[str, Any], view: ManifestView) -> list[_DeclaredFile]:
@@ -879,6 +1755,7 @@ def _declared_files(manifest: dict[str, Any], view: ManifestView) -> list[_Decla
                     "dataset.licence.evidence.snapshot",
                     snapshot["sha256"],
                     None,
+                    is_licence_snapshot=True,
                 )
             )
     return declared
@@ -942,10 +1819,24 @@ def _check_declared_file(
     if declared.sha256 is None:
         return  # Schema 1.0 records no checksums.
     try:
-        actual_sha256, actual_size = sha256_of_file(target)
+        actual_sha256, actual_size, has_content = _digest_file(target)
     except OSError as error:
         report.error("file-unreadable", f"{ascii(path)}: {error}", declared.location)
         return
+    if declared.is_licence_snapshot:
+        if not has_content:
+            # A checksum of nothing is still a checksum, but it preserves no evidence at all.
+            report.error(
+                "licence-snapshot-empty",
+                f"the licence snapshot {ascii(path)} is empty or holds only whitespace, so it preserves "
+                "no licence text or permission document. Save the actual text and record its "
+                "checksum. (The tool checks that something is there, not what it says.)",
+                declared.location,
+            )
+        else:
+            problem = _snapshot_problem(target, path, actual_size)
+            if problem is not None:
+                report.error(problem[0], problem[1], declared.location)
     if actual_sha256 != declared.sha256:
         report.error(
             "checksum-mismatch",
@@ -1018,6 +1909,7 @@ def _verify_files(
         ignore_patterns=ignore_patterns,
     )
     result.unmanifested_images = found.images
+    result.unmanifested_containers = found.containers
     result.unmanifested_other = found.others
     result.links_not_followed = list(scan.links)
     result.ignored_by_pattern = found.ignored_by_pattern
@@ -1029,24 +1921,42 @@ def _verify_files(
             f"in the manifest: {_names(found.images)}. They were left exactly as they are. Add "
             "them to the manifest with their provenance and licence, or remove them from the "
             "dataset directory yourself; this tool does neither. A file that is not in the "
-            "manifest has unknown rights and must not be used. Ignore patterns never apply to "
-            "images or videos.",
+            "manifest has unknown rights and must not be used. Ignore patterns never apply to a "
+            "file recognised as an image or video by its extension or first bytes. (Not every "
+            "image or video format is recognised.)",
+            "dataset directory",
+        )
+    if found.containers:
+        report.error(
+            "unmanifested-container-file",
+            f"{len(found.containers)} archive or container file(s) in the dataset directory are "
+            f"not listed in the manifest: {_names(found.containers)}. An archive, document or "
+            "data container can hold images, videos or a whole dataset that this tool cannot see "
+            "into, with unknown rights. They were left exactly as they are. Unpack and list the "
+            "contents in the manifest, or remove them from the dataset directory yourself; this "
+            "tool does neither. Ignore patterns never apply. (Listing a document or archive as "
+            "the licence snapshot does not help either: the snapshot must be plain text, so a "
+            "licence held as a PDF or scan has to be transcribed.)",
             "dataset directory",
         )
     if found.others:
         report.warn(
             "unmanifested-file",
             f"{len(found.others)} other file(s) in the dataset directory are not listed in the "
-            f"manifest: {_names(found.others)}. They were left untouched. If they are documented "
-            "metadata, leave them out of this check with an ignore pattern (--ignore-file).",
+            f"manifest: {_names(found.others)}. They were left untouched. They were not "
+            "recognised as images, videos or archives, but only their first bytes were looked at, "
+            "so a file in a format this tool does not recognise could still hold images. If they "
+            "are documented metadata, leave them out of this check with an ignore pattern "
+            "(--ignore-file).",
             "dataset directory",
         )
     if found.ignored_by_pattern:
         report.warn(
             "files-ignored-by-pattern",
             f"{len(found.ignored_by_pattern)} file(s) were left out of the unlisted-file check by "
-            f"an ignore pattern: {_names(found.ignored_by_pattern)}. A pattern can never hide an "
-            "image or a video.",
+            f"an ignore pattern: {_names(found.ignored_by_pattern)}. A pattern never hides a file "
+            "recognised as an image, a video or an archive, but it can hide a file whose format "
+            "this tool does not recognise.",
             "dataset directory",
         )
     if scan.links:
@@ -1067,3 +1977,45 @@ def _verify_files(
             "only existence was checked.",
         )
     return True
+
+
+def _lexical_key(path: Path | None) -> str:
+    """A path as a cache key, without touching the file system (so never inside a restricted folder)."""
+    return "" if path is None else os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _check_files(
+    run: ValidationRun,
+    manifest: dict[str, Any],
+    view: ManifestView,
+    dataset_dir: Path,
+    manifest_path: Path | None,
+    ignore_patterns: Sequence[str],
+) -> _FileCheck:
+    """Check a manifest's files in `dataset_dir` (`_verify_files`), at most once per run.
+
+    The result is reused only within the same run, for the same manifest object, directory,
+    manifest path and ignore patterns, so a manifest that is both validated itself and used as
+    a source (in the audit, or through several derivations) is hashed once. A new run always
+    checks the files again.
+    """
+    key = (_lexical_key(dataset_dir), _lexical_key(manifest_path), tuple(ignore_patterns))
+    cached = run.files.get(key)
+    if cached is not None and cached.document is manifest:
+        return cached
+    scratch = ValidationResult(Report())
+    verified = _verify_files(manifest, view, dataset_dir, scratch.report, scratch, manifest_path, ignore_patterns)
+    check = _FileCheck(
+        document=manifest,
+        verified=verified,
+        issues=tuple(scratch.report.issues),
+        declared=len(_declared_files(manifest, view)),
+        unmanifested_images=tuple(scratch.unmanifested_images),
+        unmanifested_containers=tuple(scratch.unmanifested_containers),
+        unmanifested_other=tuple(scratch.unmanifested_other),
+        links_not_followed=tuple(scratch.links_not_followed),
+        ignored_by_pattern=tuple(scratch.ignored_by_pattern),
+        ignored_housekeeping=tuple(scratch.ignored_housekeeping),
+    )
+    run.files[key] = check
+    return check

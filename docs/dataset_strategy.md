@@ -42,6 +42,14 @@ authorization where applicable, location precision and privacy constraints,
 acquisition conditions, label sources, and any laboratory measurement
 methods and units.
 
+In a manifest, a `ghana_field` dataset carries a `field_governance` record covering the
+collection permission, consent where it applies, location privacy and handling, a named
+reviewer with a review date, and the permitted uses. The dataset tools fail closed on it: until
+every part is documented and resolved the dataset cannot be approved, split or used for any AI
+purpose. They check that the record is present and consistent, never that it is true. The
+requirements are in [`ghana_field_governance.md`](ghana_field_governance.md). No field data has
+been collected or read yet.
+
 Do not treat field labels, photographs, or model predictions as verified
 engineering results. Keep raw records immutable; document transformations and
 retain links from derived records to their sources. Any future assessment must

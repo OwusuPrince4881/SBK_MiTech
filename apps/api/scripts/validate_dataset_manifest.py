@@ -17,10 +17,15 @@ from app.dataset_manifest import (  # noqa: E402
     ManifestLoadError,
     RestrictedPathError,
     ValidationResult,
+    describe_sources,
     load_manifest,
-    source_view,
+    load_source_views,
+    parse_source_dataset_dirs,
     validate_document,
 )
+from app.dataset_manifest.console import say  # noqa: E402
+from app.dataset_manifest.schema import SchemaLoadError, assert_offline_schema, make_validator  # noqa: E402
+from app.dataset_manifest.sources import dataset_id_of  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_SCHEMA_PATH = PROJECT_ROOT / "docs" / "dataset_manifest.schema.json"
@@ -40,7 +45,9 @@ def validate_manifest(
     """Schema-1.0 structural validation only. Kept as is for existing callers.
 
     `validate_document` in `app.dataset_manifest` checks both schema versions
-    and adds the cross-record, permission and file checks.
+    and adds the cross-record, permission and file checks. A schema other than the
+    built-in one must be usable offline (local references only), like a custom
+    schema given to the command line.
     """
     try:
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
@@ -55,11 +62,13 @@ def validate_manifest(
         raise ManifestValidationError(
             f"Manifest schema is invalid: {error.message}"
         ) from error
+    if schema_path != DEFAULT_SCHEMA_PATH:
+        try:
+            assert_offline_schema(schema)
+        except SchemaLoadError as error:
+            raise ManifestValidationError(str(error)) from error
 
-    validator = Draft202012Validator(
-        schema,
-        format_checker=Draft202012Validator.FORMAT_CHECKER,
-    )
+    validator = make_validator(schema)
     errors = sorted(
         validator.iter_errors(manifest),
         key=lambda error: (list(map(str, error.absolute_path)), error.message),
@@ -77,9 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Validate a MineMat AI dataset manifest (schema 1.0 or 1.1): structure, unique "
             "IDs, one split per physical sample, evaluation isolation, the UMaT/MN273 "
-            "prohibition, licence and permission consistency, derivations, and optionally the "
-            "files and their SHA-256 checksums. Exit 0 if valid, 2 on any failure. Valid means "
-            "consistent: this tool does not judge whether a licence permits a use."
+            "prohibition, licence and permission consistency, Ghana field-data governance, "
+            "derivations, and optionally the files and their SHA-256 checksums. Exit 0 if valid, "
+            "2 on any failure. Valid means consistent: this tool does not judge whether a "
+            "licence permits a use. It is offline: it never uses the network and never reads a "
+            "file because a schema or manifest names it."
         )
     )
     parser.add_argument("manifest", type=Path, help="Path to the JSON manifest")
@@ -89,7 +100,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "An extra schema the manifest must also satisfy. The built-in schema always applies, "
-            "so this can only add to it"
+            "so this can only add to it. Only references inside the schema itself ('#...') are "
+            "allowed; a remote or file reference, or an $id, is refused. A schema in a restricted "
+            "location is refused"
         ),
     )
     parser.add_argument(
@@ -111,7 +124,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "With --dataset-dir: leave non-image files matching this pattern out of the check for "
             "files that are not in the manifest, for example 'README.md' or 'notes/*' (repeatable). "
-            "A pattern can never hide an image or a video, and every file it leaves out is listed. "
+            "A pattern never hides a file recognised as an image, a video or an archive (by "
+            "extension or first bytes); it can hide a file in a format this tool does not "
+            "recognise. Every file it leaves out is listed. "
             "The pattern matches the whole relative path, case-sensitively; '*' also matches '/'. "
             "The manifest file itself and the licence snapshot are left out automatically"
         ),
@@ -126,7 +141,24 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "The manifest of another dataset that records in this one derive from (repeatable). "
             "A derivation from a dataset whose manifest is not supplied cannot be established "
-            "and is an error"
+            "and is an error. Two sources with the same dataset_id, or a source with this "
+            "manifest's dataset_id, are refused. Give its directory with --source-dataset-dir"
+        ),
+    )
+    parser.add_argument(
+        "--source-dataset-dir",
+        dest="source_dataset_dirs",
+        action="append",
+        default=[],
+        metavar="DATASET_ID=DIRECTORY",
+        help=(
+            "The dataset directory of a source given with --source-manifest (repeatable, always "
+            "with the source's dataset_id). Its record files and licence snapshot are checked there "
+            "as --dataset-dir checks this manifest's own: each must exist and match its SHA-256, and "
+            "the snapshot must be real text. A derived dataset that is in use is refused unless "
+            "every source, through the whole chain of derivations, verifies this way. The "
+            "directory is never guessed; a restricted location, an unknown or repeated dataset_id, "
+            "and a directory shared with another dataset are refused"
         ),
     )
     parser.add_argument(
@@ -172,11 +204,11 @@ def _print_listing(title: str, names: list[str], stream: TextIO) -> None:
     """Print every name (escaped to ASCII, as they come from disk), up to a generous cap."""
     if not names:
         return
-    print(title, file=stream)
+    say(title, file=stream)
     for name in names[:MAX_LISTED]:
-        print(f"  {ascii(name)}", file=stream)
+        say(f"  {ascii(name)}", file=stream)
     if len(names) > MAX_LISTED:
-        print(f"  ... and {len(names) - MAX_LISTED} more", file=stream)
+        say(f"  ... and {len(names) - MAX_LISTED} more", file=stream)
 
 
 def _print_file_findings(result: ValidationResult, stream: TextIO) -> None:
@@ -186,45 +218,42 @@ def _print_file_findings(result: ValidationResult, stream: TextIO) -> None:
         stream,
     )
     _print_listing(
+        "Archive or container files in the dataset directory that are not in the manifest (left untouched):",
+        result.unmanifested_containers,
+        stream,
+    )
+    _print_listing(
         "Other files in the dataset directory that are not in the manifest (left untouched):",
         result.unmanifested_other,
         stream,
     )
     _print_listing(
-        f"Links in the dataset directory (refused, not followed, left untouched):",
+        "Links in the dataset directory (refused, not followed, left untouched):",
         result.links_not_followed,
         stream,
     )
     if result.ignored_by_pattern:
         _print_listing(
             f"{len(result.ignored_by_pattern)} file(s) left out of the unlisted-file check by an "
-            "ignore pattern (images and videos are never left out):",
+            "ignore pattern (files recognised as images, videos or archives are never left out):",
             result.ignored_by_pattern,
             stream,
         )
     if result.ignored_housekeeping:
         _print_listing(
-            f"{len(result.ignored_housekeeping)} housekeeping file(s) skipped:",
+            f"{len(result.ignored_housekeeping)} housekeeping file(s) skipped (their content is "
+            "not a recognised image, video or archive):",
             result.ignored_housekeeping,
             stream,
         )
 
 
-def _load_sources(paths: list[Path]) -> dict[str, Any]:
-    sources: dict[str, Any] = {}
-    for path in paths:
-        loaded = load_manifest(path)
-        try:
-            view = source_view(loaded.document)
-        except ValueError as error:
-            raise ManifestLoadError(f"'{path}' cannot be used as a source manifest: {error}") from error
-        sources.setdefault(view.dataset_id, view)
-    return sources
-
-
 def _run(arguments: argparse.Namespace) -> int:
+    source_dirs = parse_source_dataset_dirs(arguments.source_dataset_dirs)
     loaded = load_manifest(arguments.manifest)
-    sources = _load_sources(arguments.source_manifests)
+    sources = load_source_views(
+        arguments.source_manifests, own_dataset_id=dataset_id_of(loaded.document), dataset_dirs=source_dirs
+    )
 
     result = validate_document(
         loaded.document,
@@ -237,59 +266,73 @@ def _run(arguments: argparse.Namespace) -> int:
         provenance_sources=sources,
     )
     if not result.ok:
-        print(result.report.format(), file=sys.stderr)
+        say(result.report.format(), file=sys.stderr)
+        for line in describe_sources(sources, result.source_assessments):
+            say(line, file=sys.stderr)
         _print_file_findings(result, sys.stderr)
-        print(
+        say(
             f"Manifest is NOT valid: {arguments.manifest} "
             f"({len(result.report.errors)} error(s), {len(result.report.warnings)} warning(s))",
             file=sys.stderr,
         )
         return EXIT_FAILURE
 
-    print(f"Manifest is valid: {arguments.manifest}")
-    print(
+    say(f"Manifest is valid: {arguments.manifest}")
+    say(
         f"  schema {result.version}; {result.record_count} record(s); "
         f"{result.sample_count} physical sample(s) {_describe_identity(result.sample_identity_basis)}"
     )
+    if arguments.schema is not None:
+        say(
+            f"  an extra custom schema was applied (it can only add requirements): {arguments.schema}"
+        )
     if result.single_image_samples:
-        print(
+        say(
             "  note: every physical sample has exactly one image, so grouping by sample protects "
             "nothing; treat the sample identity as unverified"
         )
     if result.version == "1.1":
-        print(f"  recorded permissions: {_describe_permissions(loaded.document)}")
+        say(f"  recorded permissions: {_describe_permissions(loaded.document)}")
+    if result.version == "1.1" and loaded.document["dataset"]["category"] == "ghana_field":
+        say(
+            "  field governance: the collection permission, consent and location privacy are "
+            "recorded text from the manifest. This tool checks that they are present and "
+            "consistent; it does not independently verify any of them"
+        )
+    for line in describe_sources(sources, result.source_assessments):
+        say(f"  {line}")
     if result.files_verified:
         if result.version == "1.1":
-            print("  files: every file exists, with the recorded spelling, and was checked against the manifest")
+            say("  files: every file exists, with the recorded spelling, and was checked against the manifest")
         else:
-            print("  files: every listed file exists (schema 1.0 records no checksums, so contents were not verified)")
+            say("  files: every listed file exists (schema 1.0 records no checksums, so contents were not verified)")
     else:
-        print("  files: NOT checked (pass --dataset-dir to verify files and SHA-256 checksums)")
+        say("  files: NOT checked (pass --dataset-dir to verify files and SHA-256 checksums)")
     if result.ignored_by_pattern:
-        print(
+        say(
             f"  {len(result.ignored_by_pattern)} file(s) were left out of the unlisted-file check by: "
             f"{', '.join(arguments.ignore_patterns)}"
         )
     if result.cleared_uses:
-        print(f"  recorded permission accepted for: {', '.join(result.cleared_uses)}")
+        say(f"  recorded permission accepted for: {', '.join(result.cleared_uses)}")
     if result.commercial_training_cleared:
-        print(
+        say(
             "  commercial training: the manifest declares it permitted (its basis is free text "
             "and is not verified; this is separate from the training permission)"
         )
     if result.cleared_uses or result.commercial_training_cleared:
-        print(
+        say(
             "  the files and the licence snapshot match their recorded checksums. This is the "
             "manifest's own declaration: this tool does not judge the licence or confirm that "
             "the use is lawful"
         )
     else:
-        print(
+        say(
             "  no use was requested: valid means consistent, and nothing was cleared for any use "
             "(pass --use training together with --dataset-dir to check the recorded permission)"
         )
     for issue in result.report.warnings:
-        print(issue.format())
+        say(issue.format())
     _print_file_findings(result, sys.stdout)
     return 0
 
@@ -305,10 +348,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return _run(arguments)
     except (ManifestLoadError, RestrictedPathError) as error:
-        print(f"ERROR: {error}", file=sys.stderr)
+        say(f"ERROR: {error}", file=sys.stderr)
         return EXIT_FAILURE
     except Exception as error:  # noqa: BLE001 - report, with the documented exit code, not a traceback
-        print(f"ERROR: unexpected failure ({type(error).__name__}): {error}", file=sys.stderr)
+        say(f"ERROR: unexpected failure ({type(error).__name__}): {error}", file=sys.stderr)
         return EXIT_FAILURE
 
 

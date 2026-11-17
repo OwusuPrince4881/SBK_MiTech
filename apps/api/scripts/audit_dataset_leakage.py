@@ -14,7 +14,8 @@ from app.dataset_manifest import (  # noqa: E402
     audit_manifests,
     load_manifest,
 )
-from app.dataset_manifest.audit import NOT_CHECKED  # noqa: E402
+from app.dataset_manifest.audit import NOT_CHECKED, SCOPE_NOTICE  # noqa: E402
+from app.dataset_manifest.console import say  # noqa: E402
 
 EXIT_FAILURE = 2
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
@@ -30,7 +31,9 @@ def build_parser() -> argparse.ArgumentParser:
             "it checks identical image content in several splits or datasets, derivations "
             "between the manifests, and capture sessions that straddle splits. Pass every "
             "manifest that should be kept apart, and the manifest of every dataset that records "
-            "derive from, in one run. Exit 0 if no errors, 2 otherwise."
+            "derive from, in one run. Exit 0 if no errors, 2 otherwise. A PASS means no leakage "
+            "was found; it is not approval of the splits: small splits and split-file warnings "
+            "are reported as limitations."
         )
     )
     parser.add_argument("manifests", nargs="+", type=Path, help="Manifest JSON files, split fields filled in")
@@ -44,7 +47,23 @@ def build_parser() -> argparse.ArgumentParser:
             "The dataset directory for a manifest, so its files, checksums and licence snapshot "
             "are verified and unlisted files, links and restricted folders are reported. Repeat "
             "it with DATASET_ID=DIRECTORY for several manifests. Without it the manifest's files "
-            "are not verified, which the result states. Restricted locations are refused"
+            "are not verified, which the result states. A manifest that is in use and derives "
+            "records from another manifest also needs that source's directory: the derivation is "
+            "refused unless the source's files verify. Two manifests may not share a directory. "
+            "Restricted locations are refused"
+        ),
+    )
+    parser.add_argument(
+        "--split-file",
+        dest="split_files",
+        action="append",
+        default=[],
+        metavar="[DATASET_ID=]PATH",
+        help=(
+            "The split file written by generate_dataset_splits.py for a manifest. It is checked "
+            "against the manifest (same dataset, records, splits and physical samples) and its "
+            "warnings are reported as limitations. Repeat it with DATASET_ID=PATH for several "
+            "manifests"
         ),
     )
     parser.add_argument(
@@ -55,7 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATTERN",
         help=(
             "Leave non-image files matching this pattern out of the unlisted-file check "
-            "(repeatable). A pattern can never hide an image or a video"
+            "(repeatable). A pattern never hides a file recognised as an image, a video or an "
+            "archive"
         ),
     )
     parser.add_argument(
@@ -79,21 +99,21 @@ def _describe_identity(basis: str | None, single_image: bool) -> str:
     return f"basis recorded as {basis}"
 
 
-def _map_dataset_dirs(
-    parser: argparse.ArgumentParser, values: list[str], labels: dict[str, str]
+def _map_by_dataset(
+    parser: argparse.ArgumentParser, option: str, values: list[str], labels: dict[str, str]
 ) -> dict[str, Path]:
-    """Match each --dataset-dir to a manifest label; `labels` maps dataset_id -> label."""
+    """Match each value of `option` to a manifest label; `labels` maps dataset_id -> label."""
     mapping: dict[str, Path] = {}
     for value in values:
         head, separator, tail = value.partition("=")
         if separator and IDENTIFIER.fullmatch(head):
             if head not in labels:
-                parser.error(f"--dataset-dir names dataset_id {head!r}, which no manifest has")
+                parser.error(f"{option} names dataset_id {head!r}, which no manifest has")
             mapping[labels[head]] = Path(tail)
         elif len(set(labels.values())) == 1:
             mapping[next(iter(labels.values()))] = Path(value)
         else:
-            parser.error("with several manifests, give each directory as DATASET_ID=DIRECTORY")
+            parser.error(f"with several manifests, give each {option} as DATASET_ID=PATH")
     return mapping
 
 
@@ -111,29 +131,33 @@ def _run(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int:
         dataset_id = dataset.get("dataset_id") if isinstance(dataset, dict) else None
         if isinstance(dataset_id, str):
             labels.setdefault(dataset_id, label)
-    dataset_dirs = _map_dataset_dirs(parser, arguments.dataset_dirs, labels)
+    dataset_dirs = _map_by_dataset(parser, "--dataset-dir", arguments.dataset_dirs, labels)
+    split_paths = _map_by_dataset(parser, "--split-file", arguments.split_files, labels)
     if any(not pattern for pattern in arguments.ignore_patterns):
         parser.error("--ignore-file needs a non-empty pattern")
     if arguments.ignore_patterns and not dataset_dirs:
         parser.error("--ignore-file needs --dataset-dir")
+    split_files = {label: load_manifest(path).document for label, path in split_paths.items()}
 
     result = audit_manifests(
         inputs,
         dataset_dirs=dataset_dirs,
         manifest_paths=manifest_paths,
         ignore_patterns=arguments.ignore_patterns,
+        split_files=split_files,
     )
-    print(f"Leakage audit of {len(inputs)} manifest(s)")
+    say(f"Leakage audit of {len(inputs)} manifest(s)")
     for summary in result.summaries:
         splits = ", ".join(f"{name} {count}" for name, count in summary.split_counts.items())
+        samples = ", ".join(f"{name} {count}" for name, count in summary.samples_per_split.items())
         category = summary.category or "not recorded (schema 1.0)"
-        print(f"  {summary.label}")
-        print(f"    schema {summary.version}; dataset {summary.dataset_id!r}; category {category}")
-        print(
+        say(f"  {summary.label}")
+        say(f"    schema {summary.version}; dataset {summary.dataset_id!r}; category {category}")
+        say(
             "    sample identity: "
             + _describe_identity(summary.sample_identity_basis, summary.single_image_samples)
         )
-        print(
+        say(
             "    files: "
             + (
                 "verified against the dataset directory"
@@ -141,45 +165,51 @@ def _run(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int:
                 else "NOT verified (no usable --dataset-dir)"
             )
         )
-        print(
+        say(
             f"    {summary.records} record(s); {summary.samples} physical sample(s); "
             f"{summary.sessions} capture session(s); {summary.records_without_session} "
             "record(s) without a session"
         )
-        print(f"    records per split: {splits}")
+        say(f"    records per split: {splits}")
+        say(f"    physical samples per split: {samples}")
+        say(f"    split file: {'supplied and checked' if summary.label in split_files else 'not supplied'}")
 
     report = result.report
-    print(f"Findings: {len(report.errors)} error(s), {len(report.warnings)} warning(s)")
+    say(f"Findings: {len(report.errors)} error(s), {len(report.warnings)} warning(s)")
     if report.issues:
-        print(report.format())
-    print("Declared checksums are trusted unless a dataset directory is supplied for the manifest.")
-    print("Not checked: " + "; ".join(NOT_CHECKED) + ".")
-    print(
+        say(report.format())
+    say("Declared checksums are trusted unless a dataset directory is supplied for the manifest.")
+    say("Not checked: " + "; ".join(NOT_CHECKED) + ".")
+    say(
         "This audit reads what manifests declare; it does not judge whether any licence "
         "permits a use."
     )
 
     if result.unverified_identity:
-        print(
+        say(
             "LIMITATION: the physical sample IDs are NOT verified for: "
             + "; ".join(result.unverified_identity)
             + ". Images of one physical sample can sit in different splits without this audit "
             "noticing, so sample-level leakage cannot be ruled out for them."
         )
     if result.files_not_verified:
-        print(
+        say(
             "LIMITATION: files and licence snapshots were NOT verified against their checksums "
             "for: "
             + "; ".join(result.files_not_verified)
             + ". Pass --dataset-dir to verify them."
         )
+    for label, messages in result.split_quality.items():
+        for message in messages:
+            say(f"LIMITATION: split quality ({label}): {message}")
+    say(SCOPE_NOTICE)
 
     passed = result.passed(strict=arguments.strict)
     verdict = "FAIL"
     if passed:
         verdict = "PASS WITH LIMITATIONS" if result.limitations else "PASS"
     suffix = " (strict: warnings count as failures)" if arguments.strict else ""
-    print(f"RESULT: {verdict}{suffix}")
+    say(f"RESULT: {verdict}{suffix}")
     return 0 if passed else EXIT_FAILURE
 
 
@@ -189,10 +219,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return _run(parser, arguments)
     except (ManifestLoadError, RestrictedPathError) as error:
-        print(f"ERROR: {error}", file=sys.stderr)
+        say(f"ERROR: {error}", file=sys.stderr)
         return EXIT_FAILURE
     except Exception as error:  # noqa: BLE001 - report, with the documented exit code, not a traceback
-        print(f"ERROR: unexpected failure ({type(error).__name__}): {error}", file=sys.stderr)
+        say(f"ERROR: unexpected failure ({type(error).__name__}): {error}", file=sys.stderr)
         return EXIT_FAILURE
 
 

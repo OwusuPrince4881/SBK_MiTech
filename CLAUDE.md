@@ -81,7 +81,7 @@ apps/api/app/{api,domain,persistence,schemas,services,settings,storage}   implem
 apps/api/app/{engineering,ml}      EMPTY packages (placeholders for future logic)
 apps/api/app/dataset_manifest/     offline manifest tooling (validation, splits, leakage audit); pure Python, no FastAPI/SQLAlchemy
 apps/api/scripts/{validate_dataset_manifest,generate_dataset_splits,audit_dataset_leakage}.py
-apps/api/tests/                    pytest suite (conftest.py, dataset_builders.py + 9 test files)
+apps/api/tests/                    pytest suite (conftest.py, dataset_builders.py + the test files, `test_dataset_*.py` for the dataset tooling)
 apps/api/migrations/               only .gitkeep — no Alembic yet
 apps/api/requirements.txt
 apps/web, packages, tests/         .gitkeep placeholders only
@@ -202,32 +202,68 @@ What is and is not enforced today (verified):
   ghana_field`), licence version, URL and preserved evidence (a checksummed snapshot of the licence text, an archive link or a
   reference, with its capture date), permissions (status, permitted uses, commercial-training status and its basis, reviewer and
   date, an informational authorisation reference), the basis of the physical sample IDs, capture session IDs, per-file SHA-256, a dataset-declared
-  label vocabulary and provenance. Both are JSON
-  Schema 2020-12 with `additionalProperties: false`. 1.1 still has **no** location/privacy, laboratory-measurement, video or
-  registry-link fields, so it is not yet sufficient for `ghana_field` data. Material categories are never defined by this repo.
+  label vocabulary and provenance, and, for `ghana_field` only, an optional dataset-level `field_governance` record (collection
+  permission, consent, location privacy and handling, reviewer and date, permitted uses). Both are JSON
+  Schema 2020-12 with `additionalProperties: false`. 1.1 still has **no** per-photograph location, laboratory-measurement, video or
+  registry-link fields. **Ghana field data fails closed:** a `ghana_field` dataset cannot be approved, listed with a use, split or
+  cleared until every safeguard in `field_governance` is resolved (`docs/ghana_field_governance.md`); the tools check that the record is
+  present and consistent, never that it is true, and never fill a gap in. Material categories are never defined by this repo.
 - `apps/api/scripts/validate_dataset_manifest.py` (library: `app/dataset_manifest/`) validates both versions: structure, unique
   IDs and paths, one split per physical sample, evaluation isolation (evaluation records never share a manifest with other splits,
   in either version), derivations, and for 1.1 the licence/permission rules, label vocabulary and dates. **Restricted material is
   refused in every tool:** category `umat_practical` is an error for every use (an authorisation reference is ignored), manifests
-  mentioning UMaT or MN273 in their dataset ID, name, source or paths are refused whatever their category, and the tools refuse the
+  with UMaT, MN273 or "University of Mines and Technology" in **any string** (authorisation reference, notes, licence text, sample IDs
+  and paths included) are refused whatever their category (the letters `umat` are caught even glued into `UMaTData` or `myumat`,
+  except inside a short list of innocent words such as Sumatra, pneumatic, humate, Umatilla, rheumatic; any other word containing
+  `umat` is refused; best-effort, and lower-case `teammn273` is not caught), source manifests get the same check, and the tools refuse the
   restricted locations (`data/evaluation`, `data/umat_practicals`, `data/uploads`) lexically, before touching the file system, for
   datasets, manifests, source manifests and outputs (`app/dataset_manifest/restricted.py`). **A use is accepted only against
   verified files:** `--use` (and the splitter) need `--dataset-dir`, files and the licence **snapshot** matching their recorded
   checksums, and a snapshot (a reference or link does not clear a use); the output says "recorded permission accepted", never
   "confirmed", because the tools do not judge licences; commercial training is cleared separately and only if training is permitted.
   With `--dataset-dir` the validator also checks that the recorded path matches the on-disk letter case (judged from the
-  directory listing), reports unlisted files (an unlisted image or video, including one recognised by its first bytes, is an error),
-  and treats any symbolic link or junction as an error (never followed); `--ignore-file` leaves out only non-image files and every
-  ignored file is listed. Derivations across datasets need the source manifest (`--source-manifest`, or the audit) and fail closed
-  otherwise; nothing may be derived from restricted or evaluation records. `generate_dataset_splits.py` makes seeded splits grouped
-  by physical sample (never by image), refuses evaluation and restricted data, and records every warning (small validation/test
-  split, missing category, unlabelled or conflicting samples, one image per sample) in the split file. `audit_dataset_leakage.py`
+  directory listing), reports unlisted files (an unlisted image, video **or archive/container**, recognised by extension or by the
+  first 512 bytes, is an error, and a housekeeping name such as `.gitkeep` is judged by content, so a JPEG so named is an error),
+  and treats any symbolic link or junction as an error (never followed); `--ignore-file` leaves out only files not recognised as
+  media or archives and every ignored file is listed. **The extension and signature lists are practical, not complete:** a format
+  with neither a listed extension nor a recognised signature is only a warning, and a pattern can hide it; never claim that every
+  image or video format is detected. Derivations across datasets need the source manifest (`--source-manifest`, or the audit) and fail closed
+  otherwise; nothing may be derived from restricted or evaluation records, and **a derivative inherits its source's governance**:
+  each source manifest is fully validated and a derivation from an invalid, denied, unapproved, unresolved-Ghana, snapshot-less or
+  use-ineligible source is refused identically by the validator, splitter and audit (`derived-from-*-source` codes; warnings only
+  while the derivative is a draft). **A source's evidence is verified, not trusted:** each source is bound explicitly to its
+  dataset directory (`--source-dataset-dir DATASET_ID=DIR` for the validator and splitter; the audit's `--dataset-dir
+  DATASET_ID=DIR`; never inferred from the manifest's location) and its record files and licence snapshot are checked there as
+  `--dataset-dir` checks a manifest's own, recursively down the chain, with inherited uses (`derived-from-source-files-not-verified`,
+  `derived-from-source-files-invalid`; same or nested directories are `ambiguous-dataset-directory`). **Commercial training is
+  inherited too:** when it is requested, needed downstream, or recorded as `permitted` by a derived dataset, every source down the
+  chain must record `permitted` with a meaningful basis (`derived-from-source-commercial-training-denied` / `-not-permitted` /
+  `-unsupported`); a derived dataset cannot grant a broader commercial permission than its sources. Files are hashed once per run
+  and never cached across runs; verification shows the evidence is intact, not that the licence permits the use or that recorded
+  consent is true, and a file changed after it was hashed is not detected until the next run (time of check). `generate_dataset_splits.py` makes seeded
+  splits grouped by physical sample (never by image), refuses evaluation and restricted data, and records every warning (small
+  validation/test split, missing category, unlabelled or conflicting samples, one image per sample) in the split file, rendering all
+  its output first and writing every output file or none. **It never writes inside the dataset directory** (`--output` and
+  `--output-manifest` resolving into it are refused, with or without `--overwrite`) and never over a source manifest.
+  `audit_dataset_leakage.py`
   runs the full validation on every manifest (so an invalid manifest is an audit error), takes `--dataset-dir DATASET_ID=DIR`, and
   reports identical content, cross-manifest derivations and capture sessions; its result is `PASS WITH LIMITATIONS` when identity
-  is unverified (assumed, one image per sample, schema 1.0) or a manifest's files were not verified. An
+  is unverified (assumed, one image per sample, schema 1.0), a manifest's files were not verified, or a validation/test/evaluation
+  split has fewer than 30 physical samples or a supplied `--split-file` (checked against the manifest) carries warnings. It prints on
+  every run that it checks leakage only and that a PASS is not approval of the splits. An
   `assumed_each_image_distinct` identity is never treated as verified and the splitter needs a written reason
   (`--accept-unverified-sample-identity REASON`), recorded in the split file; `inferred_by_documented_analysis` needs notes. All
   tools exit 2 on any failure with a message, never a traceback (hostile JSON, custom schemas and unexpected errors included).
+  **The tools are offline:** a custom `--schema` may only use references inside itself (`#...`; a remote, `file:` or relative
+  `$ref`, or an `$id`, is refused before anything is opened), validators are built with a registry that cannot retrieve, a schema in a
+  restricted location is refused unread, and the built-in schema always applies, so a custom schema only adds requirements. All
+  output is passed through `safe_text` (plain ASCII, non-ASCII shown as escapes) so a non-Latin path cannot make a finished run
+  fail. Evidence quality: a licence snapshot must be real plain text, not blank (`licence-snapshot-empty`), not an image, video,
+  archive, PDF or other binary content (`licence-snapshot-not-text`; recognised by extension and a few signatures, **not
+  complete**, and only the first MiB is inspected) and not a placeholder (`licence-snapshot-meaningless`);
+  evidence/review/retrieval dates may not be in the future (`date-in-future`), and a commercial-training basis must be more than a
+  placeholder (`commercial-training-basis-not-meaningful`). Ghana `field_governance` text must not be a placeholder either
+  (`x`, `n/a`, `none`, `unknown`, `yes`, blank). All plausibility checks only, never a legal determination or verification.
   See `docs/dataset_workflow.md`. Not covered: near-duplicate images (perceptual hash/embeddings), wrongly assigned physical sample
   IDs, image contents, the dataset registry, and whether any licence actually permits a use.
   Schema 1.0 manifests get the structure and cross-record checks but can never be cleared for a use (no permission data) and
@@ -261,8 +297,9 @@ cd apps\api
 ..\..\.venv\Scripts\python.exe -m pytest -v
 ```
 
-Verified 2026-11-10 (Milestone 2B remediation after the independent audit): **703 passed, 3 skipped** with one Starlette deprecation warning (`httpx`
-with `starlette.testclient`); the run takes from about 1.5 to 5 minutes depending on machine load. The three skips are
+Verified 2026-11-16 (Milestone 2B commercial-training inheritance, not yet independently reviewed): **1623 passed, 3 skipped** with one
+Starlette deprecation warning (`httpx` with `starlette.testclient`); the run takes about 11 to 25 minutes on this machine,
+depending on load. The three skips are
 platform-bound: a newline in a file name (cannot exist on Windows), two names differing only in case (cannot exist on a
 case-insensitive file system), and a real symbolic link (this Windows account cannot create one; a scripted directory entry covers it). Bare `pytest` and runs from the repo root fail with `ModuleNotFoundError: No module named 'app'`
 because there is no pytest configuration (no `pytest.ini`/`pyproject.toml`) and tests import `app.*` and `scripts.*`.

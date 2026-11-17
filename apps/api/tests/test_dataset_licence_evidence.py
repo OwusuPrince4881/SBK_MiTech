@@ -6,7 +6,7 @@ import pytest
 
 from app.dataset_manifest import SplitConfig, SplitGenerationError, generate_splits, validate_document
 from app.dataset_manifest.validation import ValidationResult
-from dataset_builders import build_dataset, clone, sha256_hex
+from dataset_builders import build_dataset, clone, field_governance, sha256_hex
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 EXAMPLE_1_1 = REPO_ROOT / "docs" / "examples" / "example_dataset_manifest_1_1.json"
@@ -369,6 +369,8 @@ def test_the_authorisation_reference_is_not_demanded_of_other_categories(
         if category == "public":
             manifest["dataset"]["licence"]["url"] = "https://example.invalid/licence"
             manifest["dataset"]["source"]["url"] = "https://example.invalid/source"
+        if category == "ghana_field":
+            manifest["dataset"]["field_governance"] = field_governance()  # approved only with one
 
         assert validate_document(manifest).ok, category
 

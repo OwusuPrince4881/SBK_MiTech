@@ -58,6 +58,7 @@ records[]       one entry per image file
 | `permissions` | yes | What it may be used for (below). |
 | `sample_identity` | yes | How the physical sample IDs were established (below). |
 | `label_vocabulary` | if any record has a `label` | The categories this dataset uses: `vocabulary_id`, `version`, `categories[]`. |
+| `field_governance` | `ghana_field` datasets (refused on any other category) | Collection permission, consent, location privacy, reviewer and permitted uses (below). Without a resolved record a `ghana_field` dataset cannot be approved, split or used. |
 
 **`source`**: `name` (required); optional `url` (http or https), `doi`, `custodian`,
 `retrieved_on` (date), `citation`. A `public` dataset must give a `url` or a `doi`.
@@ -75,7 +76,7 @@ can change or disappear. It is required once `permissions.status` is `approved`.
 | Field | Required | Meaning |
 |---|---|---|
 | `captured_on` | yes | Date the evidence was captured or obtained. |
-| `snapshot` | one of the three | `relative_path` (relative to the dataset directory) and `sha256` of a saved copy of the licence text or permission document. With `--dataset-dir` the file must exist, match its checksum and use exactly the recorded spelling. |
+| `snapshot` | one of the three | `relative_path` (relative to the dataset directory) and `sha256` of a saved copy of the licence text or permission document, as **plain text**. With `--dataset-dir` the file must exist, match its checksum, use exactly the recorded spelling, and be real text: an image, archive, PDF, other binary file, a file with no visible text, or a placeholder is refused. |
 | `archive_url` | one of the three | A link to an archived copy (http or https). |
 | `reference` | one of the three | Where the evidence is kept, for example a permission letter number. |
 | `notes` | no | Free text. |
@@ -106,6 +107,24 @@ reference or archive link can be recorded but does not clear a use.
 
 `independent_evaluation` can only be listed on its own: evaluation data must never
 also train or tune a model.
+
+**`field_governance`** (Ghana field data; see [`ghana_field_governance.md`](ghana_field_governance.md)).
+All parts are recorded text: the tools check that they are present and consistent, not that they
+are true. Required to be present: `collection_permission`, `consent` and `location_privacy`.
+
+| Field | Values | Resolved when |
+|---|---|---|
+| `collection_permission.status` | `documented`, `pending`, `not_obtained`, `unknown` | `documented`, with `granted_by`, `reference` and `recorded_on` also given |
+| `consent.status` | `obtained`, `not_applicable`, `pending`, `not_obtained`, `unknown` | `obtained` or `not_applicable`, with `basis` (and optionally `reference`) given |
+| `location_privacy.handling` | `removed`, `generalised`, `exact_restricted`, `unresolved` | not `unresolved`; `generalised` needs `precision`, `exact_restricted` needs `access_restriction` (`notes` is optional) |
+| `reviewed_by`, `reviewed_on` | text, date | both given, the date not in the future and not before `collection_permission.recorded_on` |
+| `permitted_uses` | any of `training`, `validation`, `testing`, `independent_evaluation` | at least one; `permissions.permitted_uses` may not exceed it |
+
+A `ghana_field` dataset is **approved, split or used only when every part is resolved**
+(`field-governance-unresolved` is an error as soon as `permissions.status` is `approved`, any use is
+listed, a record has a split, or a use is requested). While it is a draft (not approved, no uses, every
+record `unassigned`) the gaps are a warning. `field_governance` is an optional addition within
+schema 1.1: no existing manifest changes meaning.
 
 **`sample_identity.basis`**: how you know which images show the same physical
 sample. This is what makes grouped splitting trustworthy.
@@ -168,6 +187,8 @@ All are errors unless marked as a warning. Each finding has a stable code.
 |---|---|
 | `schema` | The structure does not match the JSON Schema. No other check runs until this passes. |
 | `unsupported-schema-version` | `schema_version` is missing or not `1.0` or `1.1`. |
+| `schema-unavailable` | A schema could not be used: unreadable, not valid, too large, with a reference that is not local (`#...`) or an `$id`, or with a local reference that does not resolve. The validator is offline and never fetches a remote or local file because a schema names it. |
+| `restricted-schema` | A custom `--schema` is in a restricted location. Refused before it is opened. |
 | `duplicate-record-id`, `ambiguous-record-id` | Record IDs must be unique, also ignoring letter case. |
 | `duplicate-relative-path`, `ambiguous-relative-path` | One file must not be recorded twice, also ignoring letter case. |
 | `ambiguous-physical-sample-id`, `ambiguous-capture-session-id` | IDs differing only in case could split one sample or session. |
@@ -175,12 +196,18 @@ All are errors unless marked as a warning. Each finding has a stable code.
 | `duplicate-checksum` | Two records must not have identical content. |
 | `filename-mismatch` | `filename` must match the end of `relative_path`. |
 | `invalid-date` | A date or timestamp is not a real calendar date. |
+| `date-in-future` | An evidence, review or retrieval date (`licence.evidence.captured_on`, `permissions.reviewed_on`, `source.retrieved_on`, and the two field-governance dates) is later than today in UTC. Camera timestamps and annotation dates are not judged this way. |
 | `public-missing-licence-url`, `public-missing-source-reference` | A `public` dataset must record the licence URL and a source URL or DOI. |
 | `restricted-category` | Category `umat_practical` is refused for every use, in every tool, whatever else the manifest records. |
-| `restricted-material-suspected` | The dataset ID, name, source or a file path mentions UMaT or MN273: refused whatever the category says. |
+| `restricted-material-suspected` | Any string in the manifest (ID, name, description, source, licence or permission text, authorisation reference, notes, sample, record or session ID, label, path) carries UMaT, MN273 or "University of Mines and Technology": refused whatever the category says. The letters `umat` are matched wherever they run together, including inside a longer identifier (`UMaTData`, `umatphotos`, `myumat`, `images/UMaTphotos/a.jpg`), except inside a short list of innocent words (`Sumatra`, `pneumatic`, `humate`, `Umatilla`, `rheumatic` and a few more) that are set aside as pieces; any other word containing `umat` is refused and has to be renamed. `MN273` is matched with separators or leading zeros, and in capitals after a lower-case letter (`ProjectMN273`), but not inside a longer number or word, and lower-case `teammn273` is not caught. A best-effort check on names, not proof of anything. |
 | `approval-without-licence-evidence` | `approved` needs `licence.evidence`. |
 | `evidence-after-review` | The licence evidence was captured after the review that relied on it. |
 | `commercial-training-basis-missing` | `commercial_training: permitted` needs `commercial_training_basis`. |
+| `commercial-training-basis-not-meaningful` | The basis is a placeholder (`x`, `n/a`, `TBD`, `see licence`), has fewer than 8 letters and digits, or is repeated characters. A plausibility check on the text, not a legal judgement. |
+| `field-governance-unresolved` | A `ghana_field` dataset that is approved, lists a use, has a split or is asked for a use has a missing or unresolved safeguard (error); a draft with gaps gets the same code as a warning. A recorded text field that is only a placeholder (`x`, `n/a`, `none`, `unknown`, `yes`, `TBD`, whitespace or invisible characters), repeats one character, or is too short to name anything (a name or reference needs 3 letters or digits, an explanation 8) counts as a gap. These are plausibility checks on the text: what a record says is declared by its author, never independently verified by the tool. |
+| `field-governance-not-applicable` | `field_governance` on a category other than `ghana_field`. |
+| `use-exceeds-field-permission` | `permissions.permitted_uses` allows a use that `field_governance.permitted_uses` does not. |
+| `field-permission-after-review` | The field collection permission was recorded after the review that relied on it. |
 | `commercial-training-without-training-permission` | `commercial_training: permitted` while `training` is not in `permitted_uses`. |
 | `identity-notes-missing` | `inferred_by_documented_analysis` needs `sample_identity.notes`. |
 | `evaluation-records-mixed` | `independent_evaluation` applies to a whole dataset, so those records cannot share a manifest with other splits (both schema versions). |
@@ -191,6 +218,22 @@ All are errors unless marked as a warning. Each finding has a stable code.
 | `model-label-as-ground-truth` | `model_generated` labels cannot be in `validation`, `test` or `independent_evaluation`. |
 | `derived-from-self`, `derived-from-unknown-record`, `derived-sample-mismatch` | Within a dataset, a derivative must derive from another existing record and keep that record's physical sample ID. |
 | `derived-source-unverified` | A record derives from a dataset whose manifest was not supplied, so the derivation cannot be established (`--source-manifest`, or the audit). |
+| `derived-from-invalid-source` | The source manifest is validated in full, with the same context, and does not validate. |
+| `derived-from-denied-source`, `derived-from-unapproved-source`, `derived-from-source-without-permission-data` | The source records permission `denied`, a status other than `approved` (`unknown`, `pending_review`), or is schema 1.0, which records no permissions. |
+| `derived-from-unresolved-field-source` | The source is `ghana_field` data whose governance record has an unresolved safeguard or a placeholder. |
+| `derived-from-source-without-licence-snapshot`, `derived-from-source-use-not-permitted` | The source is approved but preserves no licence snapshot, or does not list the use (training, validation, testing) the derivative is put to. |
+| `derivation-cycle`, `derived-source-unassessed` | Derivations loop back to this dataset, or the source is supplied only as a structural view with no manifest to validate. |
+| `derived-from-source-files-not-verified` | No dataset directory was bound to the source (`--source-dataset-dir DATASET_ID=DIR`; the audit's `--dataset-dir DATASET_ID=DIR`), so its record files and licence snapshot were not checked. A manifest's list of files is not evidence that they exist. |
+| `derived-from-source-files-invalid` | The source's files were checked in its directory and failed, exactly as `--dataset-dir` would fail them: a missing file, a checksum or size mismatch, a missing or invalid licence snapshot, an unlisted image, archive or link, a missing or restricted directory. |
+| `derived-from-source-commercial-training-denied`, `derived-from-source-commercial-training-not-permitted`, `derived-from-source-commercial-training-unsupported` | Commercial training is requested for this dataset, needed by a dataset derived from it, or recorded here as `permitted`, but a source records it as `not_permitted`, as `unknown`, or as `permitted` without a meaningful basis. Commercial permission is inherited down the whole chain, and a derived dataset cannot grant a broader commercial permission than its sources. |
+| `ambiguous-dataset-directory` | Two datasets (this one and a source, two sources, or two audited manifests) are bound to the same directory, or one directory is inside the other. Always an error. |
+
+The source-governance and source-file codes above are errors once the derivative is in use (a record has a
+split, a use was requested, or the manifest is recorded as approved or lists permitted uses) and
+warnings while it is still a draft. A source's files and licence snapshot are verified in the directory
+bound to it; that shows the recorded evidence is intact, while what the source records (permission,
+licence, consent) is still declared, not independently verified. A chain of derivations is followed, and
+every dataset in it is verified the same way.
 | `derived-from-restricted-source`, `derived-from-evaluation-record`, `derived-into-evaluation`, `derivation-crosses-splits` | Across datasets: nothing may be derived from restricted material or from an evaluation record, an evaluation record may not be derived from other data, and a derivative and its source must share a split. |
 | `derivation-split-undetermined` (warning) | A derivation across datasets where one side is still unassigned. |
 | `sample-label-conflict` (warning) | One physical sample has records with different categories. |
@@ -211,9 +254,13 @@ With `--dataset-dir`:
 | `file-missing`, `file-outside-dataset-dir`, `file-through-link` | A listed file (an image or the licence snapshot) is not there, resolves outside the directory, or is reached through a link, which is never followed. |
 | `path-case-mismatch` | The recorded path differs from the real name only in letter case or Unicode form. Judged from the directory listing, so it is the same on every operating system. |
 | `file-unreadable`, `checksum-mismatch`, `size-mismatch` | The file cannot be read, or does not match its recorded SHA-256 or size. |
-| `unmanifested-image-file` | An image or video (by extension, or by its first bytes whatever its name) in the directory is not listed in the manifest. Ignore patterns never apply. Never added, removed or changed by the tools. |
-| `unmanifested-file` (warning) | Another file in the directory is not listed. The manifest itself, the licence snapshot and housekeeping files are left out. |
-| `files-ignored-by-pattern` (warning) | Files an `--ignore-file` pattern left out of the unlisted-file check: the count and every name. Never an image, video or link. |
+| `licence-snapshot-empty` | The licence snapshot is empty or has no visible text (only a byte-order mark, whitespace, non-breaking or zero-width characters), even though its checksum matches. The tool checks that something is there, not what it says. |
+| `licence-snapshot-not-text` | The licence snapshot is recognised as an image, video, archive, PDF or other container (by its extension or its first bytes), is not valid UTF-8 (UTF-16 with a byte-order mark is also read), or holds control characters such as NUL. A snapshot must be plain text. Recognition is by extension and a few known signatures and is not complete: an unrecognised binary format is caught only because it is not valid text. |
+| `licence-snapshot-meaningless` | The snapshot is text, but a placeholder (`x`, `n/a`, `TBD`, `see licence`), punctuation with no letters or digits, built from fewer than 4 different characters, or shorter than 8 letters and digits. A plausibility check only. Only the first megabyte is inspected (the whole file is hashed). |
+| `unmanifested-image-file` | An image or video in the directory is not listed in the manifest, recognised by its extension or by its first bytes, whatever the file is called (a JPEG named `.gitkeep` included). Ignore patterns never apply to it. The lists of extensions and signatures are practical, not complete. Never added, removed or changed by the tools. |
+| `unmanifested-container-file` | An archive or container (ZIP, tar, gzip, 7z, RAR, PDF, Office document, NumPy, HDF5, SQLite, Parquet and similar, by extension or first bytes) is not listed in the manifest. It can hold images or a whole dataset the tool cannot see into. Ignore patterns never apply. The licence snapshot may be listed in the manifest, but it must still be plain text (`licence-snapshot-not-text`), so it cannot be used to carry an archive or an image. |
+| `unmanifested-file` (warning) | Another file in the directory is not listed. Only its first bytes were looked at, so a format the tool does not recognise could still hold images. The manifest itself, the licence snapshot and genuine housekeeping files are left out. |
+| `files-ignored-by-pattern` (warning) | Files an `--ignore-file` pattern left out of the unlisted-file check: the count and every name. A pattern never hides a file recognised as an image, video or archive, or a link, but it can hide a file whose format is not recognised. |
 | `link-in-dataset-dir` | A symbolic link or junction in the directory, whatever it is named. Never followed; the directory is refused while any exists. |
 
 ## Restricted material
@@ -225,10 +272,12 @@ not be used for training, validation, testing or independent AI evaluation.
 No manifest field overrides this: not `permissions.authorisation_reference`, `status`,
 `licence`, or `category`. A manifest with category `umat_practical` is refused for every use
 (`restricted-category`) by the validator, the splitter and the audit, and an authorisation
-reference recorded in it is ignored. The category is not the only protection: manifests that
-mention UMaT or MN273 in their dataset ID, name, source or file paths are refused too
-(`restricted-material-suspected`), the restricted folders are never entered, and nothing may
-be derived from such material. This holds for schema 1.0 as well as 1.1.
+reference recorded in it is ignored. The category is not the only protection: manifests with
+UMaT or MN273 in any string (dataset ID, name, notes, authorisation reference, sample IDs, paths
+and the rest) are refused too (`restricted-material-suspected`), a source manifest that names
+itself that way is not trusted as a source, the restricted folders are never entered, and nothing
+may be derived from such material. This holds for schema 1.0 as well as 1.1. The name check is
+best-effort and is not proof that anything is safe.
 
 Any future proposal to use this material needs explicit written permission from the
 appropriate authority and a separate governance review before any processing, outside these
@@ -238,10 +287,13 @@ tools. There is no exception mechanism. See [`dataset_workflow.md`](dataset_work
 
 Adding any of these needs a new schema version and an owner decision:
 
-- **Location and privacy.** Where a photograph was taken and how precisely. This is
-  required by the field-collection rules in `dataset_strategy.md` before Ghanaian
-  field data is collected, so schema 1.1 is **not yet sufficient** for
-  `ghana_field` datasets.
+- **Location of individual photographs.** Where each photograph was taken and how
+  precisely. Schema 1.1 records only the *dataset-level* decision on how location is
+  handled (`field_governance.location_privacy`), and the tools do not read photographs for
+  location data. A `ghana_field` dataset can be approved only when that decision, the
+  collection permission, consent and a reviewer are all recorded and resolved
+  ([`ghana_field_governance.md`](ghana_field_governance.md)); recording per-photograph
+  location would need a new schema version and an owner decision.
 - **Laboratory measurements.** Schema 1.0 attached them to images with only a
   value, unit and method. Real use needs the physical sample, standard, date,
   laboratory and uncertainty, so they are deliberately left out of 1.1.
@@ -280,8 +332,8 @@ inferred. Do the migration by hand, from the real source records:
 
 The validator now applies several checks to 1.0 manifests that the schema alone did not:
 it rejects duplicate IDs and paths, a sample in several splits, and (like 1.1) evaluation
-records mixed with other splits; it refuses manifests that mention UMaT or MN273 in their
-dataset ID, name, source or file paths; it fails closed on derivations it cannot establish;
+records mixed with other splits; it refuses manifests that mention UMaT or MN273 in any string;
+it fails closed on derivations it cannot establish;
 and with `--dataset-dir` it checks for unlisted files, links and case mismatches. A 1.0
 manifest that passed before can therefore fail. 1.0 manifests also carry an
 `unverified-sample-identity` warning, because 1.0 does not record how the sample IDs were
@@ -293,9 +345,11 @@ Schema 1.1 was tightened twice after its first draft, before any real manifest e
 `commercial_training_basis` and the file checks. Then, after an independent audit: the
 UMaT/MN273 prohibition replaced the earlier independent-evaluation allowance, links became
 errors, a use is accepted only against verified files and a licence snapshot, derivations are
-checked across manifests, and contradictory permissions are rejected. These are part of 1.1,
-not a new version. From here on, a manifest written for 1.1 follows the rules in this
-document.
+checked across manifests, and contradictory permissions are rejected. A further review added the
+optional `field_governance` record for Ghana field data, evidence-quality checks (non-empty
+snapshots, no future dates, a meaningful commercial-training basis), archives as errors, and an
+offline custom-schema rule. These are part of 1.1, not a new version. From here on, a manifest
+written for 1.1 follows the rules in this document.
 
 Schema 1.x versions are additive: a new minor version may add optional fields or
 enum values. Anything that removes or renames a field, or tightens a rule so that

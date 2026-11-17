@@ -20,8 +20,23 @@ from app.dataset_manifest.splits import (
     apply_splits,
     generate_splits,
 )
+from app.dataset_manifest.console import safe_text
 from app.dataset_manifest.restricted import RestrictedPathError, ensure_not_restricted
-from app.dataset_manifest.validation import ValidationResult, source_view, validate_document
+from app.dataset_manifest.restricted_names import find_restricted_name
+from app.dataset_manifest.sources import (
+    SourceDirectoryError,
+    describe_sources,
+    load_source_views,
+    parse_source_dataset_dirs,
+)
+from app.dataset_manifest.validation import (
+    SourceAssessment,
+    ValidationResult,
+    ValidationRun,
+    assess_source,
+    source_view,
+    validate_document,
+)
 
 __all__ = [
     "AuditResult",
@@ -30,16 +45,25 @@ __all__ = [
     "ManifestLoadError",
     "Report",
     "RestrictedPathError",
+    "SourceAssessment",
+    "SourceDirectoryError",
     "SplitConfig",
     "SplitGenerationError",
     "SplitResult",
     "ValidationResult",
+    "ValidationRun",
     "apply_splits",
+    "assess_source",
     "audit_manifests",
+    "describe_sources",
     "dumps_canonical",
     "ensure_not_restricted",
+    "find_restricted_name",
     "generate_splits",
     "load_manifest",
+    "load_source_views",
+    "parse_source_dataset_dirs",
+    "safe_text",
     "source_view",
     "validate_document",
 ]

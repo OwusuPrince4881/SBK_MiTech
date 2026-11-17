@@ -121,6 +121,9 @@
         },
         "label_vocabulary": {
           "$ref": "#/$defs/label_vocabulary"
+        },
+        "field_governance": {
+          "$ref": "#/$defs/field_governance"
         }
       }
     },
@@ -318,6 +321,111 @@
         },
         "notes": {
           "$ref": "#/$defs/text"
+        }
+      }
+    },
+    "field_governance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "collection_permission",
+        "consent",
+        "location_privacy"
+      ],
+      "properties": {
+        "collection_permission": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "documented",
+                "pending",
+                "not_obtained",
+                "unknown"
+              ]
+            },
+            "granted_by": {
+              "$ref": "#/$defs/short_text"
+            },
+            "reference": {
+              "$ref": "#/$defs/short_text"
+            },
+            "recorded_on": {
+              "$ref": "#/$defs/date"
+            }
+          }
+        },
+        "consent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "obtained",
+                "not_applicable",
+                "pending",
+                "not_obtained",
+                "unknown"
+              ]
+            },
+            "basis": {
+              "$ref": "#/$defs/text"
+            },
+            "reference": {
+              "$ref": "#/$defs/short_text"
+            }
+          }
+        },
+        "location_privacy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "handling"
+          ],
+          "properties": {
+            "handling": {
+              "enum": [
+                "removed",
+                "generalised",
+                "exact_restricted",
+                "unresolved"
+              ]
+            },
+            "precision": {
+              "$ref": "#/$defs/short_text"
+            },
+            "access_restriction": {
+              "$ref": "#/$defs/text"
+            },
+            "notes": {
+              "$ref": "#/$defs/text"
+            }
+          }
+        },
+        "reviewed_by": {
+          "$ref": "#/$defs/short_text"
+        },
+        "reviewed_on": {
+          "$ref": "#/$defs/date"
+        },
+        "permitted_uses": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "training",
+              "validation",
+              "testing",
+              "independent_evaluation"
+            ]
+          }
         }
       }
     },

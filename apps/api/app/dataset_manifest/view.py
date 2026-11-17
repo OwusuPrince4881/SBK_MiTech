@@ -5,8 +5,11 @@ Schema 1.0 and 1.1 name things differently (`images`/`records`, `sample_id`/
 audit, read this view instead of the raw documents.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+from app.dataset_manifest.restricted_names import restricted_text_hits
 
 ASSIGNED_SPLITS = ("train", "validation", "test", "independent_evaluation")
 UNASSIGNED = "unassigned"
@@ -33,6 +36,23 @@ class ManifestView:
     dataset_id: str
     category: str | None
     records: tuple[RecordView, ...]
+    # (location, excerpt, name) of every string in the manifest that carries a UMaT/MN273
+    # name. Computed for every manifest, so a source manifest is checked like any other.
+    restricted_hits: tuple[tuple[str, str, str], ...] = ()
+    # The parsed manifest this view was built from (a reference, not a copy). A derivation
+    # from this dataset is judged by validating this document in full, never from the
+    # structure-only view: permission status, licence evidence, Ghana field governance and
+    # every other rule. A view built by hand has no document and cannot be used as a source.
+    document: Any = field(default=None, repr=False, compare=False)
+    # The dataset directory that this manifest's relative paths refer to, when the caller has
+    # bound one explicitly (`--source-dataset-dir DATASET_ID=DIR`, or the audit's
+    # `--dataset-dir DATASET_ID=DIR`). It is never inferred from where the manifest file is.
+    # A source without one cannot have its files and licence snapshot verified, so it cannot
+    # support a derived dataset that is in use.
+    dataset_dir: Path | None = field(default=None, repr=False, compare=False)
+    # Where the manifest file was read from, so that it can be left out of the unlisted-file
+    # check when it is stored inside its own dataset directory.
+    manifest_path: Path | None = field(default=None, repr=False, compare=False)
 
     def samples(self) -> dict[str, list[RecordView]]:
         grouped: dict[str, list[RecordView]] = {}
@@ -62,7 +82,9 @@ def build_view(manifest: dict[str, Any], version: str) -> ManifestView:
             )
             for index, image in enumerate(manifest["images"])
         )
-        return ManifestView("1.0", dataset["dataset_id"], None, records)
+        return ManifestView(
+            "1.0", dataset["dataset_id"], None, records, restricted_text_hits(manifest), manifest
+        )
 
     records = tuple(
         RecordView(
@@ -82,4 +104,6 @@ def build_view(manifest: dict[str, Any], version: str) -> ManifestView:
         )
         for index, record in enumerate(manifest["records"])
     )
-    return ManifestView("1.1", dataset["dataset_id"], dataset["category"], records)
+    return ManifestView(
+        "1.1", dataset["dataset_id"], dataset["category"], records, restricted_text_hits(manifest), manifest
+    )

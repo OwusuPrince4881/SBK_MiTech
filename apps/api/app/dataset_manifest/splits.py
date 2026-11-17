@@ -21,7 +21,13 @@ from typing import Any
 
 from app.dataset_manifest.issues import Report, summarise_ids
 from app.dataset_manifest.schema import detect_version
-from app.dataset_manifest.validation import ASSUMED_IDENTITY, SPLIT_TO_USE, validate_document
+from app.dataset_manifest.validation import (
+    ASSUMED_IDENTITY,
+    EVALUATION,
+    RESTRICTED_CATEGORY,
+    SPLIT_TO_USE,
+    validate_document,
+)
 from app.dataset_manifest.view import UNASSIGNED, ManifestView, build_view
 
 SPLIT_NAMES = ("train", "validation", "test")
@@ -34,6 +40,16 @@ MAX_REASON_LENGTH = 500
 # A validation or test split with fewer physical samples than this is flagged. A rule of thumb:
 # it says the estimate will be very uncertain, not that 30 samples would make it reliable.
 SMALL_SPLIT_SAMPLES = 30
+
+
+def small_split_message(name: str, samples: int, records: int) -> str:
+    """The warning for a validation or test split with few physical samples (also used by the audit)."""
+    return (
+        f"split {name!r} has only {samples} physical sample(s) "
+        f"({records} record(s)). With fewer than {SMALL_SPLIT_SAMPLES} "
+        "physical samples, a performance estimate from it is very uncertain and must not "
+        "be presented as reliable evidence of how well a model works."
+    )
 
 
 class SplitGenerationError(ValueError):
@@ -72,6 +88,8 @@ class SplitResult:
     ignored_file_patterns: list[str] = field(default_factory=list)
     ignored_files: list[str] = field(default_factory=list)
     single_image_per_sample: bool = False
+    # The source datasets assessed while the derivations were checked (not part of the split file).
+    source_assessments: dict[str, Any] = field(default_factory=dict)
 
     def to_document(self) -> dict[str, Any]:
         """The split file. It carries no timestamp, so equal inputs give equal bytes."""
@@ -167,7 +185,7 @@ def generate_splits(
         )
 
     view = build_view(working, "1.1")
-    if any(record.split == "independent_evaluation" for record in view.records):
+    if any(record.split == EVALUATION for record in view.records):
         raise SplitGenerationError("Independent evaluation records must not be split.")
     assigned = [record.record_id for record in view.records if record.split != UNASSIGNED]
     if assigned:
@@ -236,6 +254,7 @@ def generate_splits(
         ignored_file_patterns=list(ignore_patterns),
         ignored_files=list(validation.ignored_by_pattern),
         single_image_per_sample=single_image,
+        source_assessments=dict(validation.source_assessments),
     )
 
 
@@ -322,11 +341,10 @@ def _restriction_kind(manifest: Any) -> str | None:
     dataset = manifest.get("dataset") if isinstance(manifest, dict) else None
     records = manifest.get("records") if isinstance(manifest, dict) else None
     category = dataset.get("category") if isinstance(dataset, dict) else None
-    if category == "umat_practical":
+    if category == RESTRICTED_CATEGORY:
         return "restricted"
     has_evaluation = isinstance(records, list) and any(
-        isinstance(record, dict) and record.get("split") == "independent_evaluation"
-        for record in records
+        isinstance(record, dict) and record.get("split") == EVALUATION for record in records
     )
     return "evaluation" if has_evaluation else None
 
@@ -451,12 +469,8 @@ def _summarise(
     warnings: list[str] = []
     for name in ("validation", "test"):
         if name in ratios and per_split[name]["physical_samples"] < SMALL_SPLIT_SAMPLES:
-            count = per_split[name]["physical_samples"]
             warnings.append(
-                f"split {name!r} has only {count} physical sample(s) "
-                f"({per_split[name]['records']} record(s)). With fewer than {SMALL_SPLIT_SAMPLES} "
-                "physical samples, a performance estimate from it is very uncertain and must not "
-                "be presented as reliable evidence of how well a model works."
+                small_split_message(name, per_split[name]["physical_samples"], per_split[name]["records"])
             )
     for category in sorted(totals):
         if category == UNLABELLED:

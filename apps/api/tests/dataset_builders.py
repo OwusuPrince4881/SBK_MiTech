@@ -60,6 +60,31 @@ def base_manifest(**dataset_overrides: Any) -> dict[str, Any]:
     return {"schema_version": "1.1", "dataset": dataset, "records": []}
 
 
+def field_governance(**overrides: Any) -> dict[str, Any]:
+    """A resolved Ghana field-governance record made of placeholders.
+
+    Nothing here is a real permission, consent or review: it is fictional text for tests.
+    """
+    record: dict[str, Any] = {
+        "collection_permission": {
+            "status": "documented",
+            "granted_by": "synthetic-fixture-authority",
+            "reference": "synthetic-fixture-permission-1",
+            "recorded_on": "2026-01-15",
+        },
+        "consent": {
+            "status": "not_applicable",
+            "basis": "Synthetic fixture: no people or private land appear in these generated files.",
+        },
+        "location_privacy": {"handling": "removed"},
+        "reviewed_by": "synthetic-test-fixture",
+        "reviewed_on": "2026-02-01",
+        "permitted_uses": list(PERMITTED_USES),
+    }
+    record.update(overrides)
+    return record
+
+
 def make_record(
     record_id: str,
     sample_id: str,

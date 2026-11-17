@@ -505,8 +505,8 @@ def test_split_cli_requires_seed_output_and_dataset_directory(missing: str, tmp_
 # --- audit_dataset_leakage -------------------------------------------------------------
 
 
-def split_workspace(root: Path) -> tuple[Path, dict[str, Any]]:
-    manifest_path, dataset_dir, _ = make_workspace(root, sample_count=30)
+def split_workspace(root: Path, sample_count: int = 30) -> tuple[Path, dict[str, Any]]:
+    manifest_path, dataset_dir, _ = make_workspace(root, sample_count=sample_count)
     assert run_split(manifest_path, dataset_dir, root / "s.json", "--output-manifest", str(root / "split.json")) == 0
     return root / "split.json", load_manifest(root / "split.json").document
 
@@ -770,7 +770,9 @@ def test_audit_cli_never_prints_a_bare_pass_for_unverified_identity(
 def test_audit_cli_gives_a_plain_pass_when_the_identity_basis_is_recorded(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    path, _ = split_workspace(tmp_path)
+    # 240 samples, so that the validation and test splits each hold the 30 or more physical
+    # samples below which the audit qualifies its result (see the split-quality tests).
+    path, _ = split_workspace(tmp_path, sample_count=240)
     capsys.readouterr()
 
     code = audit_dataset_leakage.main([str(path), "--dataset-dir", str(tmp_path / "files")])
@@ -781,6 +783,7 @@ def test_audit_cli_gives_a_plain_pass_when_the_identity_basis_is_recorded(
     assert "files: verified against the dataset directory" in out
     assert "LIMITATION" not in out
     assert "RESULT: PASS\n" in out
+    assert "leakage only" in out and "not approval of the splits" in out
 
 
 def test_audit_cli_treats_schema_1_0_as_an_unverified_identity(capsys: pytest.CaptureFixture[str]) -> None:

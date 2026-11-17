@@ -90,6 +90,22 @@ def derive(record: dict[str, Any], dataset_id: str, record_id: str) -> None:
     record["provenance"] = {"derived_from": [{"dataset_id": dataset_id, "record_id": record_id}]}
 
 
+def distinct_source(root: Path, *, split: str | None = None, dataset_id: str = "source-set") -> dict[str, Any]:
+    """A two-sample source whose files hold content of their own, recorded with their real checksums.
+
+    Its content differs from the derived dataset's, so the audit sees no identical images, and its
+    checksums match the files, so it passes verification in its own directory.
+    """
+    source = build_dataset(root, sample_count=2, images_per_sample=2, dataset_id=dataset_id)
+    for record in source["records"]:
+        content = f"{dataset_id}:{record['record_id']}".encode()
+        (root / record["file"]["relative_path"]).write_bytes(content)
+        record["file"].update(sha256=sha256_hex(content), size_bytes=len(content))
+        if split is not None:
+            record["split"] = split
+    return source
+
+
 # === H2: the audit validates semantically ===================================================
 
 
@@ -147,7 +163,7 @@ def test_audit_runs_the_sample_identity_checks(dataset: tuple[dict[str, Any], Pa
 def test_audit_runs_the_licence_evidence_checks(dataset: tuple[dict[str, Any], Path]) -> None:
     manifest = split_manifest(dataset[0])
     manifest["dataset"]["permissions"]["commercial_training"] = "permitted"
-    manifest["dataset"]["licence"]["evidence"]["captured_on"] = "2030-01-01"
+    manifest["dataset"]["licence"]["evidence"]["captured_on"] = "2026-06-01"  # after the review, before today
 
     result = audit_manifests([("m.json", manifest)])
 
@@ -174,10 +190,16 @@ def test_audit_does_not_repeat_the_identity_warning(dataset: tuple[dict[str, Any
     assert [i.code for i in result.report.warnings].count("unverified-sample-identity") == 1
 
 
-def test_audit_passes_a_clean_verified_dataset_with_no_limitations(dataset: tuple[dict[str, Any], Path]) -> None:
-    manifest, root = dataset
+def test_audit_passes_a_clean_verified_dataset_with_no_limitations(tmp_path: Path) -> None:
+    # Large enough that no evaluated split is small: 30 or more physical samples in each of them.
+    root = tmp_path / "large"
+    manifest = build_dataset(root, sample_count=120, images_per_sample=2)
+    assignment = {
+        f"sample-{index:03d}": "train" if index < 60 else "validation" if index < 90 else "test"
+        for index in range(120)
+    }
 
-    result = audit_manifests([("m.json", split_manifest(manifest))], dataset_dirs={"m.json": root})
+    result = audit_manifests([("m.json", set_splits(manifest, assignment))], dataset_dirs={"m.json": root})
 
     assert result.passed(strict=True), result.report.format()
     assert not result.limitations
@@ -454,14 +476,15 @@ def test_records_deriving_across_ordinary_splits_are_an_error(dataset: tuple[dic
 
 
 def test_a_derivation_within_one_split_is_accepted(dataset: tuple[dict[str, Any], Path], tmp_path: Path) -> None:
-    source = build_dataset(tmp_path / "s", sample_count=2, images_per_sample=2, dataset_id="source-set")
-    for record in source["records"]:
-        record["split"] = "train"
-        record["file"]["sha256"] = sha256_hex(b"source:" + record["record_id"].encode())
+    source = distinct_source(tmp_path / "s", split="train")
     derived = split_manifest(dataset[0])
     derive(record_by_id(derived, "rec-000-0"), "source-set", "rec-000-0")  # train from train
 
-    result = audit_manifests([("derived.json", derived), ("source.json", source)])
+    # The derived dataset is in use, so its source's files must be verified in the source's own directory.
+    result = audit_manifests(
+        [("derived.json", derived), ("source.json", source)],
+        dataset_dirs={"derived.json": dataset[1], "source.json": tmp_path / "s"},
+    )
 
     assert not any(code.startswith("deriv") for code in audit_errors(result) | audit_warnings(result))
 
@@ -508,16 +531,18 @@ def test_supplying_the_source_lets_the_validator_establish_a_valid_derivation(
     dataset: tuple[dict[str, Any], Path], tmp_path: Path
 ) -> None:
     manifest, root = dataset
-    source = build_dataset(tmp_path / "s", sample_count=2, images_per_sample=2, dataset_id="source-set")
-    for record in source["records"]:
-        record["split"] = "unassigned"
-        record["file"]["sha256"] = sha256_hex(b"source:" + record["record_id"].encode())
+    source = distinct_source(tmp_path / "s", split="unassigned")
     derived = clone(manifest)
     derive(derived["records"][0], "source-set", "rec-000-0")
 
     assert codes(validate_document(derived)) == {"derived-source-unverified"}
-    result = validate_document(derived, provenance_sources={"source-set": source_view(source)})
+    unbound = validate_document(derived, provenance_sources={"source-set": source_view(source)})
+    result = validate_document(
+        derived, provenance_sources={"source-set": source_view(source, dataset_dir=tmp_path / "s")}
+    )
 
+    # The manifest alone establishes the derivation but not the source's evidence; its directory does.
+    assert codes(unbound) == {"derived-from-source-files-not-verified"}
     assert result.ok, result.report.format()
 
 
@@ -552,9 +577,7 @@ def test_the_cli_tools_take_source_manifests(
 def test_the_splitter_cli_takes_source_manifests(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     root = tmp_path / "files"
     manifest = build_dataset(root, sample_count=30, images_per_sample=2)
-    source = build_dataset(tmp_path / "src", sample_count=2, images_per_sample=2, dataset_id="source-set")
-    for record in source["records"]:
-        record["file"]["sha256"] = sha256_hex(b"source:" + record["record_id"].encode())
+    source = distinct_source(tmp_path / "src")
     derive(manifest["records"][0], "source-set", "rec-000-0")
     manifest_path = write_json(tmp_path / "manifest.json", manifest)
     source_path = write_json(tmp_path / "source.json", source)
@@ -562,9 +585,14 @@ def test_the_splitter_cli_takes_source_manifests(tmp_path: Path, capsys: pytest.
 
     refused = generate_dataset_splits.main(base)
     err = capsys.readouterr().err
-    accepted = generate_dataset_splits.main([*base, "--source-manifest", str(source_path)])
+    unverified = generate_dataset_splits.main([*base, "--source-manifest", str(source_path)])
+    unverified_err = capsys.readouterr().err
+    accepted = generate_dataset_splits.main(
+        [*base, "--source-manifest", str(source_path), "--source-dataset-dir", f"source-set={tmp_path / 'src'}"]
+    )
 
     assert refused == 2 and "derived-source-unverified" in err
+    assert unverified == 2 and "derived-from-source-files-not-verified" in unverified_err
     assert accepted == 0, capsys.readouterr().err
 
 
@@ -667,7 +695,9 @@ def test_training_can_be_cleared_while_commercial_training_stays_unknown(dataset
 
 def test_a_free_text_basis_alone_does_not_clear_commercial_training(dataset: tuple[dict[str, Any], Path]) -> None:
     manifest, root = dataset
-    manifest["dataset"]["permissions"].update(commercial_training="permitted", commercial_training_basis="x")
+    manifest["dataset"]["permissions"].update(
+        commercial_training="permitted", commercial_training_basis="Clause 4.2 of the licence."
+    )
     manifest["dataset"]["licence"]["evidence"] = {"captured_on": "2026-01-01", "reference": "a free-text note"}
 
     result = validate_document(manifest, dataset_dir=root, require_commercial_training=True)

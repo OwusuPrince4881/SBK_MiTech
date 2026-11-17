@@ -11,6 +11,7 @@ from app.dataset_manifest.validation import ValidationResult, resolve_within
 from dataset_builders import (
     build_dataset,
     clone,
+    field_governance,
     link_directory,
     record_by_id,
     set_splits,
@@ -448,6 +449,7 @@ def test_non_public_datasets_do_not_need_a_licence_url(
 ) -> None:
     manifest = clone(dataset[0])
     manifest["dataset"]["category"] = "ghana_field"
+    manifest["dataset"]["field_governance"] = field_governance()  # field data is approved only with one
 
     assert validate_document(manifest).ok
 
